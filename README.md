@@ -76,14 +76,21 @@ export DOUBAO_VOICE_TYPE="你的音色 ID"
 ./start-mobile-server.sh
 ```
 
-`DOUBAO_VOICE_TYPE` 是文档里的 `<voice_type>`，例如示例中的 `zh_female_cancan_mars_bigtts`。实际做英文原著阅读时，建议在豆包音色列表里选择适合英文或中英混读的音色。
+`DOUBAO_VOICE_TYPE` 是文档里的 `<voice_type>`。注意：`DOUBAO_RESOURCE_ID` 必须和音色所属模型匹配；如果使用 `seed-tts-2.0`，请在豆包音色列表里选择明确属于 TTS 2.0 的音色，不要使用 TTS 1.0 示例音色。实际做英文原著阅读时，建议选择适合英文或中英混读的 2.0 音色。
 
 如果没有配置 AI 服务，BerlinNote 会自动退回系统语音朗读。
 
-AI 音频缓存位置：
+AI 音频缓存默认放在项目目录的上一级，避免混进源码仓库：
 
 ```text
-outputs/epub-reader-demo/audio-cache/
+/Users/macbookairm2/编程/BerlinNote/audio-cache/
+```
+
+也可以通过环境变量自定义缓存目录：
+
+```bash
+export AUDIO_CACHE_DIR="/path/to/audio-cache"
+./start-mobile-server.sh
 ```
 
 浏览器端也会把生成过的 MP3 存入 IndexedDB，供同一台设备离线复听。

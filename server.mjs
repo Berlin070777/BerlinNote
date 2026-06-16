@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { randomBytes, randomUUID } from "node:crypto";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
-const cacheDir = join(root, "audio-cache");
+const defaultCacheDir = resolve(root, "..", "audio-cache");
+const cacheDir = process.env.AUDIO_CACHE_DIR ? resolve(process.env.AUDIO_CACHE_DIR) : defaultCacheDir;
 const port = Number(process.argv[2] || process.env.PORT || 4173);
 const bindHost = process.env.BIND_HOST || "0.0.0.0";
 const apiKey = process.env.OPENAI_API_KEY || "";
@@ -64,6 +65,8 @@ server.listen(port, bindHost, () => {
   console.log("iPhone / iPad: use the LAN address printed by start-mobile-server.sh");
   console.log(`AI TTS provider: ${ttsProvider}`);
   console.log(`AI TTS: ${ttsProvider === "doubao" ? (hasDoubaoAuth() ? "enabled" : "disabled, set DOUBAO credentials") : (apiKey ? "enabled" : "disabled, set OPENAI_API_KEY")}`);
+  if (ttsProvider === "doubao") console.log(`Doubao resource: ${doubao.resourceId}, voice: ${doubao.voiceType}`);
+  console.log(`Audio cache: ${cacheDir}`);
   console.log("");
 });
 
@@ -154,7 +157,7 @@ async function generateDoubaoSpeech({ text, style, rate }) {
       try {
         const frame = parseDoubaoFrame(message);
         if (frame.error) {
-          throw new Error(frame.error);
+          throw new Error(enhanceDoubaoError(frame.error));
         }
         if (frame.event === 50) {
           ws.send(buildDoubaoJsonFrame(100, buildDoubaoStartSessionPayload(text, style, rate), sessionId));
@@ -194,6 +197,25 @@ async function generateDoubaoSpeech({ text, style, rate }) {
 
     ws.send(buildDoubaoJsonFrame(1, {}));
   });
+}
+
+function enhanceDoubaoError(message) {
+  if (message.includes("resource ID is mismatched with speaker related resource")) {
+    return [
+      message,
+      "Fix: DOUBAO_RESOURCE_ID and DOUBAO_VOICE_TYPE must belong to the same Doubao model resource.",
+      "For seed-tts-2.0, choose a voice explicitly listed as a TTS 2.0 voice in the Doubao voice list.",
+      "Do not use a TTS 1.0 voice such as zh_female_cancan_mars_bigtts with seed-tts-2.0."
+    ].join("\n");
+  }
+  if (/unauthorized|401/i.test(message)) {
+    return [
+      message,
+      "Fix: Doubao bidirectional WebSocket does not use Authorization: Bearer.",
+      "Use old console headers DOUBAO_APP_ID + DOUBAO_ACCESS_KEY, or new console DOUBAO_API_KEY."
+    ].join("\n");
+  }
+  return message;
 }
 
 function buildDoubaoHeaders() {
