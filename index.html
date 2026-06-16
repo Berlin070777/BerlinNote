@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#f5f0e8" />
     <title>BerlinNote</title>
     <link rel="manifest" href="./manifest.webmanifest" />
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles.css?v=server-import-7" />
   </head>
   <body>
     <main class="app">
@@ -31,7 +31,7 @@
         <section class="shelf-board">
           <div class="shelf-copy">
             <p class="drop-title">你的英文原著书架</p>
-            <p class="drop-copy">导入 EPUB 后会保存到本机浏览器书架；再次打开会恢复上次阅读位置。</p>
+            <p class="drop-copy">导入 EPUB 会交给本地服务解析并保存到 books 文件夹；再次打开会恢复上次阅读位置。</p>
           </div>
           <button id="openSample" class="book-tile" type="button">
             <span>A Small Door in the Rain</span>
@@ -42,7 +42,7 @@
         <section class="bookshelf-section">
           <div class="bookshelf-head">
             <h2>本机书架</h2>
-            <small>保存在当前浏览器 IndexedDB 中</small>
+            <small>读取 books 文件夹，也保留浏览器本机导入记录</small>
           </div>
           <div id="shelfBooks" class="bookshelf-list"></div>
         </section>
@@ -131,6 +131,6 @@
     </main>
 
     <div id="toast" class="toast hidden" role="status"></div>
-    <script src="./app.js"></script>
+    <script src="./app.js?v=server-import-7"></script>
   </body>
 </html>

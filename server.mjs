@@ -1,14 +1,16 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { connect as tlsConnect } from "node:tls";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes, randomUUID } from "node:crypto";
+import { inflateRawSync } from "node:zlib";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const defaultCacheDir = resolve(root, "..", "audio-cache");
+const booksDir = process.env.BOOKS_DIR ? resolve(process.env.BOOKS_DIR) : resolve(root, "..", "books");
 const cacheDir = process.env.AUDIO_CACHE_DIR ? resolve(process.env.AUDIO_CACHE_DIR) : defaultCacheDir;
 const port = Number(process.argv[2] || process.env.PORT || 4173);
 const bindHost = process.env.BIND_HOST || "0.0.0.0";
@@ -19,7 +21,7 @@ const doubao = {
   appId: process.env.DOUBAO_APP_ID || "",
   accessKey: process.env.DOUBAO_ACCESS_KEY || "",
   resourceId: process.env.DOUBAO_RESOURCE_ID || "seed-tts-2.0",
-  voiceType: process.env.DOUBAO_VOICE_TYPE || "zh_female_cancan_mars_bigtts"
+  voiceType: process.env.DOUBAO_VOICE_TYPE || "zh_female_vv_uranus_bigtts"
 };
 
 const mimeTypes = {
@@ -33,6 +35,7 @@ const mimeTypes = {
 };
 
 await mkdir(cacheDir, { recursive: true });
+await mkdir(booksDir, { recursive: true });
 
 const server = createServer(async (req, res) => {
   try {
@@ -47,6 +50,22 @@ const server = createServer(async (req, res) => {
         provider: ttsProvider,
         aiTts: ttsProvider === "doubao" ? hasDoubaoAuth() : Boolean(apiKey)
       });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/api/books") {
+      await handleBooksList(res);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/books/import") {
+      await handleBookImport(req, url, res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/api/books/") && url.pathname.endsWith("/parsed")) {
+      await handleParsedBook(url, res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/api/books/")) {
+      await handleBookFile(url, res);
       return;
     }
     await serveStatic(url, res);
@@ -70,8 +89,97 @@ server.listen(port, bindHost, () => {
     console.log(`Doubao auth: ${doubao.apiKey ? "X-Api-Key" : "X-Api-App-Key"}, token ${maskToken(doubao.apiKey || doubao.accessKey)}`);
   }
   console.log(`Audio cache: ${cacheDir}`);
+  console.log(`Books folder: ${booksDir}`);
   console.log("");
 });
+
+async function handleBooksList(res) {
+  sendJson(res, 200, { books: await listFolderBooks() });
+}
+
+async function listFolderBooks() {
+  const files = (await readdir(booksDir, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && /\.epub$/i.test(entry.name))
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b, "zh-CN"));
+  const books = await Promise.all(
+    files.map(async (fileName) => {
+      const filePath = resolve(booksDir, fileName);
+      const info = await stat(filePath);
+      return {
+        id: createCacheKey({ fileName }),
+        title: fileName.replace(/\.epub$/i, ""),
+        fileName,
+        size: info.size,
+        updatedAt: info.mtimeMs
+      };
+    })
+  );
+  return books;
+}
+
+async function handleBookImport(req, url, res) {
+  const rawName = url.searchParams.get("name") || "Imported.epub";
+  const fileName = safeEpubFileName(rawName);
+  const buffer = await readBinary(req, 120 * 1024 * 1024);
+  if (!buffer.length) {
+    sendJson(res, 400, { error: "Empty EPUB file" });
+    return;
+  }
+  const filePath = resolve(booksDir, fileName);
+  if (!filePath.startsWith(resolve(booksDir))) {
+    sendJson(res, 403, { error: "Forbidden" });
+    return;
+  }
+  await writeFile(filePath, buffer);
+  const book = await parseEpubBuffer(buffer);
+  const info = await stat(filePath);
+  const record = {
+    id: createCacheKey({ fileName }),
+    title: book.title || fileName.replace(/\.epub$/i, ""),
+    fileName,
+    size: info.size,
+    updatedAt: info.mtimeMs
+  };
+  sendJson(res, 200, { book: record, parsedBook: book });
+}
+
+async function handleParsedBook(url, res) {
+  const id = decodeURIComponent(url.pathname.slice("/api/books/".length, -"/parsed".length));
+  const filePath = await findBookPathById(id);
+  if (!filePath) {
+    sendJson(res, 404, { error: "Book not found" });
+    return;
+  }
+  const buffer = await readFile(filePath);
+  const book = await parseEpubBuffer(buffer);
+  sendJson(res, 200, { parsedBook: book });
+}
+
+async function handleBookFile(url, res) {
+  const id = decodeURIComponent(url.pathname.slice("/api/books/".length));
+  const filePath = await findBookPathById(id);
+  if (!filePath) {
+    sendJson(res, 404, { error: "Book not found" });
+    return;
+  }
+  if (!filePath.startsWith(resolve(booksDir))) {
+    sendJson(res, 403, { error: "Forbidden" });
+    return;
+  }
+  res.writeHead(200, {
+    "Content-Type": "application/epub+zip",
+    "Cache-Control": "no-store"
+  });
+  createReadStream(filePath).pipe(res);
+}
+
+async function findBookPathById(id) {
+  const files = (await readdir(booksDir, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && /\.epub$/i.test(entry.name));
+  const file = files.find((entry) => createCacheKey({ fileName: entry.name }) === id);
+  return file ? resolve(booksDir, file.name) : "";
+}
 
 async function handleTts(req, res) {
   const body = await readJson(req);
@@ -506,11 +614,33 @@ async function serveStatic(url, res) {
     return;
   }
   const ext = extname(filePath);
+  if (ext === ".html" && filePath === resolve(root, "./index.html")) {
+    const html = await renderIndexHtml(filePath);
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store"
+    });
+    res.end(html);
+    return;
+  }
   res.writeHead(200, {
     "Content-Type": mimeTypes[ext] || "application/octet-stream",
-    "Cache-Control": ext === ".html" ? "no-store" : "public, max-age=3600"
+    "Cache-Control": [".html", ".js", ".css", ".webmanifest"].includes(ext) ? "no-store" : "public, max-age=3600"
   });
   createReadStream(filePath).pipe(res);
+}
+
+async function renderIndexHtml(filePath) {
+  const html = await readFile(filePath, "utf8");
+  const books = await listFolderBooks();
+  const markup = books.length
+    ? books
+        .map(
+          (book) => `<a class="saved-book" href="./?folderBook=${encodeURIComponent(book.id)}&v=server-import-7"><strong>${escapeHtml(book.title)}</strong><span>本地 books 文件夹 · ${formatBytes(book.size)}</span></a>`
+        )
+        .join("")
+    : `<div class="empty-bookshelf">还没有书籍。可以导入 EPUB，或者把 EPUB 放进 books 文件夹。</div>`;
+  return html.replace('<div id="shelfBooks" class="bookshelf-list"></div>', `<div id="shelfBooks" class="bookshelf-list">${markup}</div>`);
 }
 
 function sendAudio(res, filePath, key, cacheStatus) {
@@ -549,12 +679,213 @@ function readJson(req) {
   });
 }
 
+function readBinary(req, limit) {
+  return new Promise((resolveRequest, rejectRequest) => {
+    const chunks = [];
+    let total = 0;
+    req.on("data", (chunk) => {
+      total += chunk.length;
+      if (total > limit) {
+        req.destroy();
+        rejectRequest(new Error("EPUB file is too large"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolveRequest(Buffer.concat(chunks)));
+    req.on("error", rejectRequest);
+  });
+}
+
+async function parseEpubBuffer(buffer) {
+  const zip = await ServerZipArchive.from(buffer);
+  const container = await zip.text("META-INF/container.xml");
+  const rootfile = getXmlAttr(container.match(/<rootfile\b[^>]*>/i)?.[0] || "", "full-path");
+  if (!rootfile) throw new Error("没有找到 EPUB rootfile。");
+
+  const opfText = await zip.text(rootfile);
+  const base = dirname(rootfile);
+  const title = decodeEntities(
+    tagText(opfText, "dc:title") || tagText(opfText, "title") || "Untitled"
+  ).trim();
+  const manifest = new Map();
+  for (const match of opfText.matchAll(/<item\b[^>]*>/gi)) {
+    const item = match[0];
+    const id = getXmlAttr(item, "id");
+    const href = getXmlAttr(item, "href");
+    if (!id || !href) continue;
+    manifest.set(id, {
+      href: resolvePath(base, href),
+      type: getXmlAttr(item, "media-type")
+    });
+  }
+
+  const spineItems = [];
+  for (const match of opfText.matchAll(/<itemref\b[^>]*>/gi)) {
+    const item = manifest.get(getXmlAttr(match[0], "idref"));
+    if (item && (/xhtml|html/i.test(item.type) || /\.x?html?$/i.test(item.href))) spineItems.push(item);
+  }
+  if (!spineItems.length) throw new Error("没有找到可阅读章节。");
+
+  const chapters = [];
+  for (const item of spineItems) {
+    const html = await zip.text(item.href);
+    const heading = extractHeading(html) || cleanChapterName(item.href);
+    const paragraphs = extractParagraphs(html);
+    if (paragraphs.length) chapters.push({ title: heading, paragraphs });
+  }
+  if (!chapters.length) throw new Error("章节里没有解析到正文。");
+  return { title, chapters };
+}
+
+function getXmlAttr(tag, name) {
+  const match = tag.match(new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, "i"));
+  return match ? decodeEntities(match[1]) : "";
+}
+
+function tagText(text, tag) {
+  const escaped = tag.replace(":", "\\:");
+  const match = text.match(new RegExp(`<${escaped}\\b[^>]*>([\\s\\S]*?)<\\/${escaped}>`, "i"));
+  return match ? stripTags(match[1]) : "";
+}
+
+function extractHeading(html) {
+  const match = html.match(/<(h1|h2|h3|title)\b[^>]*>([\s\S]*?)<\/\1>/i);
+  return match ? stripTags(match[2]).replace(/\s+/g, " ").trim() : "";
+}
+
+function extractParagraphs(html) {
+  const body = html
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ");
+  const blocks = [];
+  for (const match of body.matchAll(/<(p|blockquote|li)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
+    const line = stripTags(match[2]).replace(/\s+/g, " ").trim();
+    if (line.length > 20) blocks.push(line);
+  }
+  return blocks;
+}
+
+function stripTags(value) {
+  return decodeEntities(String(value).replace(/<[^>]+>/g, " "));
+}
+
+function decodeEntities(value) {
+  return String(value)
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'");
+}
+
+function dirname(path) {
+  const index = path.lastIndexOf("/");
+  return index === -1 ? "" : path.slice(0, index + 1);
+}
+
+function resolvePath(base, href) {
+  const stack = (base + href).split("/");
+  const out = [];
+  for (const part of stack) {
+    if (!part || part === ".") continue;
+    if (part === "..") out.pop();
+    else out.push(part);
+  }
+  return out.join("/");
+}
+
+function cleanChapterName(path) {
+  return path.split("/").pop().replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ");
+}
+
+function safeEpubFileName(name) {
+  const cleaned = String(name)
+    .replace(/[/:\\?%*"<>|]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+  return /\.epub$/i.test(cleaned) ? cleaned : `${cleaned || "Imported"}.epub`;
+}
+
+class ServerZipArchive {
+  constructor(buffer, entries) {
+    this.buffer = buffer;
+    this.entries = entries;
+  }
+
+  static async from(buffer) {
+    const eocdOffset = findServerEndOfCentralDirectory(buffer);
+    const entryCount = buffer.readUInt16LE(eocdOffset + 10);
+    let offset = buffer.readUInt32LE(eocdOffset + 16);
+    const entries = new Map();
+
+    for (let i = 0; i < entryCount; i += 1) {
+      if (buffer.readUInt32LE(offset) !== 0x02014b50) throw new Error("ZIP 中央目录损坏。");
+      const method = buffer.readUInt16LE(offset + 10);
+      const compressedSize = buffer.readUInt32LE(offset + 20);
+      const uncompressedSize = buffer.readUInt32LE(offset + 24);
+      const nameLength = buffer.readUInt16LE(offset + 28);
+      const extraLength = buffer.readUInt16LE(offset + 30);
+      const commentLength = buffer.readUInt16LE(offset + 32);
+      const localOffset = buffer.readUInt32LE(offset + 42);
+      const name = buffer.subarray(offset + 46, offset + 46 + nameLength).toString("utf8");
+      entries.set(name, { name, method, compressedSize, uncompressedSize, localOffset });
+      offset += 46 + nameLength + extraLength + commentLength;
+    }
+    return new ServerZipArchive(buffer, entries);
+  }
+
+  async text(path) {
+    return this.bytes(path).toString("utf8");
+  }
+
+  bytes(path) {
+    const entry = this.entries.get(path);
+    if (!entry) throw new Error(`EPUB 缺少文件：${path}`);
+    const local = entry.localOffset;
+    if (this.buffer.readUInt32LE(local) !== 0x04034b50) throw new Error("ZIP 本地文件头损坏。");
+    const nameLength = this.buffer.readUInt16LE(local + 26);
+    const extraLength = this.buffer.readUInt16LE(local + 28);
+    const dataStart = local + 30 + nameLength + extraLength;
+    const compressed = this.buffer.subarray(dataStart, dataStart + entry.compressedSize);
+    if (entry.method === 0) return compressed;
+    if (entry.method === 8) return inflateRawSync(compressed, { finishFlush: 4 });
+    throw new Error(`暂不支持这个 EPUB 的 ZIP 压缩方式：${entry.method}`);
+  }
+}
+
+function findServerEndOfCentralDirectory(buffer) {
+  const min = Math.max(0, buffer.length - 0xffff - 22);
+  for (let i = buffer.length - 22; i >= min; i -= 1) {
+    if (buffer.readUInt32LE(i) === 0x06054b50) return i;
+  }
+  throw new Error("这不是有效的 EPUB/ZIP 文件。");
+}
+
 function createCacheKey(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 32);
 }
 
 function cleanText(text) {
   return String(text).replace(/\s+/g, " ").trim();
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function formatBytes(value) {
+  if (!Number.isFinite(value)) return "EPUB";
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function sanitizeChoice(value, allowed, fallback) {

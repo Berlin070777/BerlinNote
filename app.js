@@ -88,8 +88,8 @@ els.input.addEventListener("change", async (event) => {
   if (!file) return;
   try {
     showToast("正在解析 EPUB...");
-    await importBook(file);
-    showToast("导入完成，已保存到本机书架。");
+    const saved = await importBook(file);
+    showToast(saved ? "导入完成，已保存到本机书架。" : "书已打开，但没有保存到本机书架。");
   } catch (error) {
     console.error(error);
     showToast(error.message || "EPUB 解析失败，请换一本标准 EPUB 试试。");
@@ -285,7 +285,6 @@ function playBook() {
   state.queueIndex = findCurrentBookQueueIndex(items);
   state.isContinuous = true;
   speakNextBookItem();
-  showToast("开始从当前位置朗读整本。");
 }
 
 function findCurrentBookQueueIndex(items) {
@@ -307,7 +306,6 @@ function playQueue(sentenceEls) {
   state.queueIndex = 0;
   state.isContinuous = true;
   speakNextInQueue();
-  showToast(`开始连续朗读 ${sentenceEls.length} 句。`);
 }
 
 function speakNextInQueue() {
@@ -370,7 +368,10 @@ async function speakText(text, el, onEnd) {
 async function getCachedAiAudio(text) {
   const request = buildAudioRequest(text);
   const key = await audioCacheKey(request);
-  const cached = await audioCache.get(key);
+  const cached = await withTimeout(audioCache.get(key), 500, "Audio IndexedDB read timeout").catch((error) => {
+    console.warn("Audio cache read skipped", error);
+    return null;
+  });
   if (cached) {
     console.info("BerlinNote audio cache hit", key);
     return cached;
@@ -387,7 +388,9 @@ async function getCachedAiAudio(text) {
     throw new Error(message);
   }
   const blob = await response.blob();
-  await audioCache.set(key, blob, request);
+  await withTimeout(audioCache.set(key, blob, request), 700, "Audio IndexedDB write timeout").catch((error) => {
+    console.warn("Audio cache write skipped", error);
+  });
   console.info("BerlinNote audio fetched", response.headers.get("X-Audio-Cache") || "network", key);
   return blob;
 }
@@ -625,48 +628,149 @@ updateCoachNote();
 updateReaderStyle();
 registerServiceWorker();
 renderSavedBooks();
+loadFolderBookFromUrl();
 loadDemoBookFromUrl();
 
 async function importBook(file) {
+  showToast("正在交给本地服务解析 EPUB...");
+  try {
+    const result = await uploadEpubToServer(file);
+    const id = `folder-${result.book.id}`;
+    await loadBook(null, result.book.title || file.name.replace(/\.epub$/i, ""), {
+      id,
+      parsedBook: result.parsedBook,
+      restore: false
+    });
+    await renderSavedBooks();
+    return true;
+  } catch (error) {
+    console.warn("Server EPUB import failed, falling back to browser parser", error);
+  }
+
   const buffer = await file.arrayBuffer();
+  showToast("本地服务解析失败，改用浏览器解析...");
   const book = await parseEpub(buffer);
   const id = `book-${hashString(`${file.name}:${file.size}:${book.title}:${book.chapters.length}`)}`;
-  await libraryStore.saveBook({
-    id,
-    title: book.title || file.name.replace(/\.epub$/i, ""),
-    fileName: file.name,
-    blob: new Blob([buffer], { type: "application/epub+zip" }),
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    chapterCount: book.chapters.length
-  });
+  showToast("正在打开阅读界面...");
   await loadBook(buffer, book.title || file.name.replace(/\.epub$/i, ""), { id, parsedBook: book, restore: true });
-  await renderSavedBooks();
+  return false;
+}
+
+async function uploadEpubToServer(file) {
+  const response = await fetch(`/api/books/import?name=${encodeURIComponent(file.name)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/epub+zip"
+    },
+    body: file
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || "服务端 EPUB 导入失败。");
+  }
+  if (!data.parsedBook?.chapters?.length) throw new Error("服务端没有解析出章节。");
+  return data;
 }
 
 async function renderSavedBooks() {
   if (!els.shelfBooks) return;
-  const books = await libraryStore.listBooks();
-  els.shelfBooks.replaceChildren();
-  if (!books.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty-bookshelf";
-    empty.textContent = "还没有导入书籍。导入 EPUB 后会出现在这里。";
-    els.shelfBooks.append(empty);
+  els.shelfBooks.replaceChildren(statusLine("正在读取 books 文件夹..."));
+  try {
+    const [books, folderBooks] = await Promise.all([
+      withTimeout(libraryStore.listBooks(), 1800, "IndexedDB 读取超时").catch((error) => {
+        console.warn("IndexedDB book list failed", error);
+        return [];
+      }),
+      withTimeout(fetchFolderBooks(), 2500, "books 文件夹接口超时").catch((error) => {
+        console.warn("Folder book list failed", error);
+        return [];
+      })
+    ]);
+    els.shelfBooks.replaceChildren();
+    if (!books.length && !folderBooks.length) {
+      els.shelfBooks.append(statusLine("还没有书籍。可以导入 EPUB，或者把 EPUB 放进 books 文件夹。"));
+      return;
+    }
+    folderBooks.forEach((book) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "saved-book";
+      const title = document.createElement("strong");
+      title.textContent = book.title || book.fileName || "Untitled";
+      const meta = document.createElement("span");
+      meta.textContent = `本地 books 文件夹 · ${formatFileSize(book.size)}`;
+      button.append(title, meta);
+      button.addEventListener("click", () => openFolderBook(book));
+      els.shelfBooks.append(button);
+    });
+    books.forEach((book) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "saved-book";
+      const title = document.createElement("strong");
+      title.textContent = book.title || book.fileName || "Untitled";
+      const meta = document.createElement("span");
+      const progress = book.progress?.chapterIndex != null ? `上次读到第 ${book.progress.chapterIndex + 1} 章` : `${book.chapterCount || 0} 章`;
+      meta.textContent = `${progress} · ${formatDate(book.updatedAt || book.createdAt)}`;
+      button.append(title, meta);
+      button.addEventListener("click", () => openSavedBook(book.id));
+      els.shelfBooks.append(button);
+    });
+  } catch (error) {
+    console.error("Book shelf render failed", error);
+    els.shelfBooks.replaceChildren(statusLine(`书架读取失败：${error.message || error}`));
+  }
+}
+
+function statusLine(text) {
+  const line = document.createElement("div");
+  line.className = "empty-bookshelf";
+  line.textContent = text;
+  return line;
+}
+
+async function fetchFolderBooks() {
+  try {
+    const response = await fetch("/api/books", { cache: "no-store" });
+    if (!response.ok) return [];
+    const data = await response.json();
+    return Array.isArray(data.books) ? data.books : [];
+  } catch {
+    return [];
+  }
+}
+
+async function openFolderBook(book) {
+  showToast("正在打开本地书库 EPUB...");
+  const response = await fetch(`/api/books/${encodeURIComponent(book.id)}/parsed`, { cache: "no-store" });
+  if (!response.ok) {
+    showToast("本地书库文件打开失败。");
     return;
   }
-  books.forEach((book) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "saved-book";
-    const title = document.createElement("strong");
-    title.textContent = book.title || book.fileName || "Untitled";
-    const meta = document.createElement("span");
-    const progress = book.progress?.chapterIndex != null ? `上次读到第 ${book.progress.chapterIndex + 1} 章` : `${book.chapterCount || 0} 章`;
-    meta.textContent = `${progress} · ${formatDate(book.updatedAt || book.createdAt)}`;
-    button.append(title, meta);
-    button.addEventListener("click", () => openSavedBook(book.id));
-    els.shelfBooks.append(button);
+  const data = await response.json();
+  await loadBook(null, book.title || book.fileName || "Untitled", {
+    id: `folder-${book.id}`,
+    parsedBook: data.parsedBook,
+    restore: false
+  });
+  showToast("本地书库 EPUB 已打开。");
+}
+
+async function loadFolderBookFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const id = params.get("folderBook");
+  if (!id) return;
+  showToast("正在打开本地书库 EPUB...");
+  const response = await fetch(`/api/books/${encodeURIComponent(id)}/parsed`, { cache: "no-store" });
+  if (!response.ok) {
+    showToast("本地书库文件打开失败。");
+    return;
+  }
+  const data = await response.json();
+  await loadBook(null, "Local Book", {
+    id: `folder-${id}`,
+    parsedBook: data.parsedBook,
+    restore: false
   });
 }
 
@@ -699,6 +803,12 @@ async function saveCurrentProgress() {
 function formatDate(value) {
   if (!value) return "刚刚";
   return new Date(value).toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
+}
+
+function formatFileSize(value) {
+  if (!Number.isFinite(value)) return "EPUB";
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function createAudioCache() {
@@ -816,8 +926,8 @@ function hashString(value) {
 
 function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
-  navigator.serviceWorker.register("./sw.js").catch((error) => {
-    console.warn("Service worker registration failed", error);
+  navigator.serviceWorker.getRegistrations?.().then((registrations) => {
+    registrations.forEach((registration) => registration.unregister());
   });
 }
 
@@ -1028,10 +1138,18 @@ async function inflateRaw(buffer, expectedSize) {
     throw new Error("当前浏览器不支持解压 EPUB。请用最新版 Safari/Chrome 试试。");
   }
   const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-  const decompressed = await new Response(stream).arrayBuffer();
+  const decompressed = await withTimeout(new Response(stream).arrayBuffer(), 12000, "EPUB 解压超时。请换一本书，或把 EPUB 放进 books 文件夹后刷新书架。");
   const bytes = new Uint8Array(decompressed);
   if (expectedSize && bytes.byteLength !== expectedSize) return bytes;
   return bytes;
+}
+
+function withTimeout(promise, ms, message) {
+  let timer = 0;
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timer));
 }
 
 function decodeBytes(buffer) {

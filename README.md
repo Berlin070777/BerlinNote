@@ -5,6 +5,7 @@
 ## 当前功能
 
 - 书架首页：展示 BerlinNote、导入 EPUB、样书入口，并预留搜索/社区/笔记入口。
+- 本地文件夹书库：把 EPUB 放进项目旁边的 `books/` 文件夹，刷新网页后会自动出现在书架。
 - 本机书架：导入 EPUB 后会保存到浏览器 IndexedDB，第二次打开仍然在书架中。
 - 阅读进度：自动保存章节、句子和滚动位置，下次打开同一本书会恢复。
 - 阅读二级页：正文铺满屏幕，顶部保留返回、目录、整本朗读、阅读设置和停止朗读。
@@ -140,6 +141,27 @@ export AUDIO_CACHE_DIR="/path/to/audio-cache"
 如果第二次仍然出现 `miss/stored`，先确认没有改变音色或语速；再强制刷新页面，避免 Safari 继续运行旧的前端缓存。
 
 ## 本地书架和阅读进度
+
+### 推荐：本地 books 文件夹
+
+如果你主要在电脑和手机网页端测试，推荐把 EPUB 直接放在项目旁边的书库文件夹：
+
+```text
+/Users/macbookairm2/编程/BerlinNote/books/
+```
+
+启动 BerlinNote 后，网页会自动读取这个文件夹里的 `.epub` 文件，并显示在书架里。这样不需要每次通过浏览器重新上传。
+
+也可以用环境变量改位置：
+
+```bash
+export BOOKS_DIR="/path/to/books"
+./start-mobile-server.sh
+```
+
+`books/` 已经加入 `.gitignore`，不建议上传到 GitHub，避免版权和仓库体积问题。
+
+### 浏览器导入
 
 导入的 EPUB 会保存到当前浏览器的 IndexedDB。只要你没有清理 Safari/浏览器的网站数据，第二次打开 BerlinNote 时，书会继续出现在“本机书架”里。
 

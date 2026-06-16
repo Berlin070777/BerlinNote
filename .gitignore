@@ -4,5 +4,7 @@
 !.env.example
 audio-cache/
 ../audio-cache/
+books/
+../books/
 *.log
 node_modules/
