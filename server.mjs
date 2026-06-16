@@ -85,23 +85,25 @@ async function handleTts(req, res) {
     return;
   }
 
-  const voice = sanitizeChoice(body.voice, ["marin", "cedar", "alloy", "verse"], "marin");
-  const style = sanitizeChoice(body.style, ["calm", "dramatic", "slow", "dialogue"], "calm");
+  const requestedVoice = cleanText(body.voice || "");
+  const openAiVoice = sanitizeChoice(requestedVoice, ["marin", "cedar", "alloy", "verse"], "marin");
+  const doubaoVoice = requestedVoice || doubao.voiceType;
   const rate = clamp(Number(body.rate || 0.9), 0.65, 1.25);
   const key = createCacheKey({
     provider: ttsProvider,
     text,
-    voice: ttsProvider === "doubao" ? doubao.voiceType : voice,
+    voice: ttsProvider === "doubao" ? doubaoVoice : openAiVoice,
     resourceId: ttsProvider === "doubao" ? doubao.resourceId : "",
-    style,
-    rate
+    rate: rate.toFixed(2)
   });
   const filePath = join(cacheDir, `${key}.mp3`);
 
   if (await exists(filePath)) {
+    console.log(`[audio-cache] hit ${key}`);
     sendAudio(res, filePath, key, "disk");
     return;
   }
+  console.log(`[audio-cache] miss ${key}`);
 
   if (ttsProvider === "doubao" && !hasDoubaoAuth()) {
     sendJson(res, 503, { error: "Doubao TTS is not configured. Set DOUBAO_APP_ID and DOUBAO_ACCESS_KEY, or DOUBAO_API_KEY." });
@@ -113,12 +115,15 @@ async function handleTts(req, res) {
     return;
   }
 
-  const audio = ttsProvider === "doubao" ? await generateDoubaoSpeech({ text, style, rate }) : await generateOpenAiSpeech({ text, voice, style, rate });
+  const audio = ttsProvider === "doubao"
+    ? await generateDoubaoSpeech({ text, voice: doubaoVoice, rate })
+    : await generateOpenAiSpeech({ text, voice: openAiVoice, rate });
   await writeFile(filePath, audio);
+  console.log(`[audio-cache] stored ${key} (${audio.length} bytes)`);
   sendAudio(res, filePath, key, "generated");
 }
 
-async function generateOpenAiSpeech({ text, voice, style, rate }) {
+async function generateOpenAiSpeech({ text, voice, rate }) {
   const response = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: {
@@ -129,8 +134,9 @@ async function generateOpenAiSpeech({ text, voice, style, rate }) {
       model: "gpt-4o-mini-tts",
       voice,
       input: text,
-      instructions: buildInstructions(style, rate),
-      response_format: "mp3"
+      instructions: buildInstructions(rate),
+      response_format: "mp3",
+      speed: rate
     })
   });
 
@@ -142,7 +148,7 @@ async function generateOpenAiSpeech({ text, voice, style, rate }) {
   return Buffer.from(await response.arrayBuffer());
 }
 
-async function generateDoubaoSpeech({ text, style, rate }) {
+async function generateDoubaoSpeech({ text, voice, rate }) {
   const ws = await openRawWebSocket("wss://openspeech.bytedance.com/api/v3/tts/bidirection", buildDoubaoHeaders());
   const sessionId = randomUUID();
   const chunks = [];
@@ -163,7 +169,7 @@ async function generateDoubaoSpeech({ text, style, rate }) {
           throw new Error(enhanceDoubaoError(frame.error));
         }
         if (frame.event === 50) {
-          ws.send(buildDoubaoJsonFrame(100, buildDoubaoStartSessionPayload(text, style, rate), sessionId));
+          ws.send(buildDoubaoJsonFrame(100, buildDoubaoStartSessionPayload(text, voice, rate), sessionId));
           return;
         }
         if (frame.event === 150 && !sessionStarted) {
@@ -250,7 +256,7 @@ function maskToken(token) {
   return `${token.slice(0, 4)}...${token.slice(-4)}`;
 }
 
-function buildDoubaoStartSessionPayload(text, style, rate) {
+function buildDoubaoStartSessionPayload(text, voice, rate) {
   const additions = {
     disable_default_bit_rate: true,
     cache_config: {
@@ -258,7 +264,7 @@ function buildDoubaoStartSessionPayload(text, style, rate) {
       use_cache: true,
       use_segment_cache: true
     },
-    context_texts: [buildDoubaoInstruction(style, rate)]
+    context_texts: [buildDoubaoInstruction(rate)]
   };
   return {
     user: { uid: "berlinnote-reader" },
@@ -266,12 +272,16 @@ function buildDoubaoStartSessionPayload(text, style, rate) {
     namespace: "BidirectionalTTS",
     req_params: {
       text: "",
-      speaker: doubao.voiceType,
+      speaker: voice,
       audio_params: {
         format: "mp3",
         sample_rate: 24000,
         bit_rate: 128000
       },
+      speed_ratio: rate,
+      volume_ratio: 1.0,
+      pitch_ratio: 1.0,
+      emotion: "",
       additions: JSON.stringify(additions)
     }
   };
@@ -285,15 +295,9 @@ function buildDoubaoTaskPayload(text) {
   };
 }
 
-function buildDoubaoInstruction(style, rate) {
-  const pace = rate < 0.8 ? "你可以说慢一点吗？" : rate > 1.08 ? "你可以用自然但稍快一点的语速朗读吗？" : "请用自然的有声书节奏朗读。";
-  const styles = {
-    calm: "请用沉浸、平静、适合英文文学阅读的旁白语气朗读。",
-    dramatic: "请用克制但有张力的戏剧化语气朗读，不要夸张。",
-    slow: "请用适合英语学习者精听的清晰语气朗读，短语之间稍作停顿。",
-    dialogue: "请用自然对白感朗读，语气要像人物正在说话。"
-  };
-  return `${styles[style] || styles.calm}${pace}`;
+function buildDoubaoInstruction(rate) {
+  const pace = rate < 0.8 ? "请用较慢语速清晰朗读。" : rate > 1.08 ? "请用自然但稍快的语速朗读。" : "请用自然的有声书节奏朗读。";
+  return `请用适合英文原著阅读的沉浸旁白语气朗读。${pace}`;
 }
 
 function buildDoubaoJsonFrame(event, payload, sessionId = "") {
@@ -484,15 +488,9 @@ function encodeWebSocketFrame(payload) {
   return Buffer.concat([header, mask, masked]);
 }
 
-function buildInstructions(style, rate) {
+function buildInstructions(rate) {
   const pace = rate < 0.8 ? "Read slowly and clearly." : rate > 1.08 ? "Read with a natural but slightly brisk pace." : "Read at a natural literary audiobook pace.";
-  const styles = {
-    calm: "Use a calm, immersive literary narrator voice with precise pauses.",
-    dramatic: "Use a restrained dramatic tone, bringing out tension without sounding exaggerated.",
-    slow: "Use a clear teaching voice for language learners, with gentle pauses after clauses.",
-    dialogue: "Use a conversational tone suitable for dialogue, with natural rhythm and intent."
-  };
-  return `${styles[style] || styles.calm} ${pace}`;
+  return `Use a calm, immersive literary narrator voice with precise pauses. ${pace}`;
 }
 
 async function serveStatic(url, res) {

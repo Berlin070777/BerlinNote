@@ -2,6 +2,9 @@ const $ = (selector) => document.querySelector(selector);
 
 const state = {
   book: null,
+  bookId: "",
+  restoreProgress: null,
+  progressSaveTimer: null,
   chapterIndex: 0,
   paragraphIndex: 0,
   sentenceIndex: 0,
@@ -25,6 +28,7 @@ const els = {
   input: $("#bookInput"),
   shelf: $("#shelfView"),
   openSample: $("#openSample"),
+  shelfBooks: $("#shelfBooks"),
   shell: $("#readerShell"),
   scrim: $("#scrim"),
   drawer: $("#drawer"),
@@ -54,7 +58,6 @@ const els = {
   lineHeight: $("#lineHeightControl"),
   rate: $("#rateControl"),
   voice: $("#voiceSelect"),
-  style: $("#styleSelect"),
   coachNote: $("#coachNote"),
   toast: $("#toast")
 };
@@ -78,14 +81,15 @@ const localDefinitions = {
 };
 
 const audioCache = createAudioCache();
+const libraryStore = createLibraryStore();
 
 els.input.addEventListener("change", async (event) => {
   const file = event.target.files?.[0];
   if (!file) return;
   try {
     showToast("正在解析 EPUB...");
-    await loadBook(await file.arrayBuffer(), file.name.replace(/\.epub$/i, ""));
-    showToast("导入完成，可以点击句子朗读了。");
+    await importBook(file);
+    showToast("导入完成，已保存到本机书架。");
   } catch (error) {
     console.error(error);
     showToast(error.message || "EPUB 解析失败，请换一本标准 EPUB 试试。");
@@ -104,10 +108,11 @@ els.prevChapter.addEventListener("click", () => goChapter(state.chapterIndex - 1
 els.nextChapter.addEventListener("click", () => goChapter(state.chapterIndex + 1));
 els.playBook.addEventListener("click", playBook);
 els.stopSpeech.addEventListener("click", stopSpeech);
-els.style.addEventListener("change", () => updateCoachNote());
+els.voice.addEventListener("change", () => updateCoachNote());
 els.speakWord.addEventListener("click", () => speakWord(els.wordTitle.textContent));
 els.fontSize.addEventListener("input", updateReaderStyle);
 els.lineHeight.addEventListener("input", updateReaderStyle);
+els.content.addEventListener("scroll", () => scheduleProgressSave());
 
 function openDrawer() {
   els.drawer.classList.add("open");
@@ -140,6 +145,7 @@ function showShelf() {
   closePanels();
   els.shell.classList.add("hidden");
   els.shelf.classList.remove("hidden");
+  renderSavedBooks();
 }
 
 function showReader() {
@@ -215,6 +221,18 @@ function renderChapter(index, options = {}) {
   });
 
   renderChapterList();
+  if (state.restoreProgress?.chapterIndex === index) {
+    const progress = state.restoreProgress;
+    state.restoreProgress = null;
+    requestAnimationFrame(() => {
+      if (typeof progress.scrollTop === "number") els.content.scrollTop = progress.scrollTop;
+      const selector = `.sentence[data-paragraph-index="${progress.paragraphIndex || 0}"][data-sentence-index="${progress.sentenceIndex || 0}"]`;
+      const savedEl = els.content.querySelector(selector);
+      if (savedEl) selectSentence(savedEl, savedEl.textContent.trim(), false);
+    });
+  } else {
+    scheduleProgressSave();
+  }
 }
 
 function selectSentence(el, text, autoplay = false) {
@@ -227,18 +245,14 @@ function selectSentence(el, text, autoplay = false) {
   el.classList.add("selected");
   el.closest("p")?.classList.add("active-paragraph");
   updateCoachNote();
+  scheduleProgressSave();
   if (autoplay) speakSelected();
 }
 
 function updateCoachNote() {
-  const style = els.style.value;
-  const notes = {
-    calm: "旁白模式：适合小说叙述段落，语速稳定，停顿更清楚。",
-    dramatic: "戏剧化模式：适合悬疑、冲突和情绪转折明显的句子。",
-    slow: "慢速精读：适合长难句，建议配合句法拆解和跟读。",
-    dialogue: "对白感：适合引号内台词，后续可根据角色自动切换声音。"
-  };
-  els.coachNote.textContent = notes[style];
+  const option = els.voice.selectedOptions?.[0];
+  const label = option?.textContent || els.voice.value;
+  els.coachNote.textContent = `当前音色：${label}。同一句文本、同一音色和语速会优先使用缓存音频。`;
 }
 
 function speakSelected() {
@@ -357,7 +371,10 @@ async function getCachedAiAudio(text) {
   const request = buildAudioRequest(text);
   const key = await audioCacheKey(request);
   const cached = await audioCache.get(key);
-  if (cached) return cached;
+  if (cached) {
+    console.info("BerlinNote audio cache hit", key);
+    return cached;
+  }
   if (!navigator.onLine) throw new Error("Offline and no cached audio");
 
   const response = await fetch("/api/tts", {
@@ -371,14 +388,14 @@ async function getCachedAiAudio(text) {
   }
   const blob = await response.blob();
   await audioCache.set(key, blob, request);
+  console.info("BerlinNote audio fetched", response.headers.get("X-Audio-Cache") || "network", key);
   return blob;
 }
 
 function buildAudioRequest(text) {
   return {
     text: text.replace(/\s+/g, " ").trim(),
-    voice: els.voice.value || "marin",
-    style: els.style.value || "calm",
+    voice: els.voice.value || "zh_female_vv_uranus_bigtts",
     rate: Number(els.rate.value || 0.9).toFixed(2)
   };
 }
@@ -421,8 +438,7 @@ function speakWithSystemVoice(text, el, onEnd, playToken) {
   if (voice) utterance.voice = voice;
   utterance.lang = voice?.lang || "en-US";
   utterance.rate = Number(els.rate.value);
-  utterance.pitch = els.style.value === "dramatic" ? 1.08 : 1;
-  if (els.style.value === "slow") utterance.rate = Math.min(utterance.rate, 0.78);
+  utterance.pitch = 1;
   utterance.onstart = () => {
     markSpeaking(el);
   };
@@ -594,10 +610,7 @@ function loadVoices() {
     .sort((a, b) => a.lang.localeCompare(b.lang) || a.name.localeCompare(b.name));
   els.voice.replaceChildren();
   [
-    ["marin", "Marin · AI narrator"],
-    ["cedar", "Cedar · AI narrator"],
-    ["alloy", "Alloy · AI fallback"],
-    ["verse", "Verse · AI fallback"]
+    ["zh_female_vv_uranus_bigtts", "豆包 2.0 · VV 女声"]
   ].forEach(([value, label]) => {
     const option = document.createElement("option");
     option.value = value;
@@ -611,25 +624,85 @@ loadVoices();
 updateCoachNote();
 updateReaderStyle();
 registerServiceWorker();
+renderSavedBooks();
 loadDemoBookFromUrl();
 
-function createAudioCache() {
-  const dbPromise = new Promise((resolveDb, rejectDb) => {
-    if (!("indexedDB" in window)) {
-      rejectDb(new Error("IndexedDB unavailable"));
-      return;
-    }
-    const request = indexedDB.open("berlinnote-offline", 1);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains("audio")) {
-        const store = db.createObjectStore("audio", { keyPath: "key" });
-        store.createIndex("createdAt", "createdAt");
-      }
-    };
-    request.onsuccess = () => resolveDb(request.result);
-    request.onerror = () => rejectDb(request.error);
+async function importBook(file) {
+  const buffer = await file.arrayBuffer();
+  const book = await parseEpub(buffer);
+  const id = `book-${hashString(`${file.name}:${file.size}:${book.title}:${book.chapters.length}`)}`;
+  await libraryStore.saveBook({
+    id,
+    title: book.title || file.name.replace(/\.epub$/i, ""),
+    fileName: file.name,
+    blob: new Blob([buffer], { type: "application/epub+zip" }),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    chapterCount: book.chapters.length
   });
+  await loadBook(buffer, book.title || file.name.replace(/\.epub$/i, ""), { id, parsedBook: book, restore: true });
+  await renderSavedBooks();
+}
+
+async function renderSavedBooks() {
+  if (!els.shelfBooks) return;
+  const books = await libraryStore.listBooks();
+  els.shelfBooks.replaceChildren();
+  if (!books.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-bookshelf";
+    empty.textContent = "还没有导入书籍。导入 EPUB 后会出现在这里。";
+    els.shelfBooks.append(empty);
+    return;
+  }
+  books.forEach((book) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "saved-book";
+    const title = document.createElement("strong");
+    title.textContent = book.title || book.fileName || "Untitled";
+    const meta = document.createElement("span");
+    const progress = book.progress?.chapterIndex != null ? `上次读到第 ${book.progress.chapterIndex + 1} 章` : `${book.chapterCount || 0} 章`;
+    meta.textContent = `${progress} · ${formatDate(book.updatedAt || book.createdAt)}`;
+    button.append(title, meta);
+    button.addEventListener("click", () => openSavedBook(book.id));
+    els.shelfBooks.append(button);
+  });
+}
+
+async function openSavedBook(id) {
+  const record = await libraryStore.getBook(id);
+  if (!record?.blob) {
+    showToast("没有找到这本书的本地文件。");
+    return;
+  }
+  const buffer = await record.blob.arrayBuffer();
+  await loadBook(buffer, record.title || record.fileName || "Untitled", { id, restore: true });
+}
+
+function scheduleProgressSave() {
+  window.clearTimeout(state.progressSaveTimer);
+  state.progressSaveTimer = window.setTimeout(saveCurrentProgress, 350);
+}
+
+async function saveCurrentProgress() {
+  if (!state.bookId) return;
+  await libraryStore.saveProgress(state.bookId, {
+    chapterIndex: state.chapterIndex,
+    paragraphIndex: state.paragraphIndex,
+    sentenceIndex: state.sentenceIndex,
+    scrollTop: els.content.scrollTop,
+    updatedAt: Date.now()
+  });
+}
+
+function formatDate(value) {
+  if (!value) return "刚刚";
+  return new Date(value).toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
+}
+
+function createAudioCache() {
+  const dbPromise = openBerlinNoteDb();
 
   return {
     async get(key) {
@@ -657,6 +730,64 @@ function createAudioCache() {
       }
     }
   };
+}
+
+function createLibraryStore() {
+  const dbPromise = openBerlinNoteDb();
+  return {
+    async saveBook(book) {
+      const db = await dbPromise;
+      const existing = await idbRequest(db.transaction("books", "readonly").objectStore("books").get(book.id));
+      await idbRequest(
+        db.transaction("books", "readwrite").objectStore("books").put({
+          ...existing,
+          ...book,
+          progress: existing?.progress || book.progress || null,
+          updatedAt: Date.now()
+        })
+      );
+    },
+    async listBooks() {
+      const db = await dbPromise;
+      const books = await idbRequest(db.transaction("books", "readonly").objectStore("books").getAll());
+      return books.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    },
+    async getBook(id) {
+      const db = await dbPromise;
+      return idbRequest(db.transaction("books", "readonly").objectStore("books").get(id));
+    },
+    async saveProgress(id, progress) {
+      const db = await dbPromise;
+      const record = await idbRequest(db.transaction("books", "readonly").objectStore("books").get(id));
+      if (!record) return;
+      record.progress = progress;
+      record.updatedAt = progress.updatedAt || Date.now();
+      await idbRequest(db.transaction("books", "readwrite").objectStore("books").put(record));
+    }
+  };
+}
+
+function openBerlinNoteDb() {
+  return new Promise((resolveDb, rejectDb) => {
+    if (!("indexedDB" in window)) {
+      rejectDb(new Error("IndexedDB unavailable"));
+      return;
+    }
+    const request = indexedDB.open("berlinnote-offline", 2);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains("audio")) {
+        const store = db.createObjectStore("audio", { keyPath: "key" });
+        store.createIndex("createdAt", "createdAt");
+      }
+      if (!db.objectStoreNames.contains("books")) {
+        const books = db.createObjectStore("books", { keyPath: "id" });
+        books.createIndex("updatedAt", "updatedAt");
+      }
+    };
+    request.onsuccess = () => resolveDb(request.result);
+    request.onerror = () => rejectDb(request.error);
+  });
 }
 
 function idbRequest(request) {
@@ -690,14 +821,24 @@ function registerServiceWorker() {
   });
 }
 
-async function loadBook(buffer, fallbackTitle = "Untitled") {
-  const book = await parseEpub(buffer);
+async function loadBook(buffer, fallbackTitle = "Untitled", options = {}) {
+  const book = options.parsedBook || await parseEpub(buffer);
   state.book = book;
+  state.bookId = options.id || "";
   state.chapterIndex = 0;
+  state.restoreProgress = null;
   showReader();
   els.bookTitle.textContent = book.title || fallbackTitle;
   renderChapterList();
-  renderChapter(0);
+  let startChapter = 0;
+  if (options.restore && state.bookId) {
+    const record = await libraryStore.getBook(state.bookId);
+    if (record?.progress) {
+      state.restoreProgress = record.progress;
+      startChapter = Math.min(record.progress.chapterIndex || 0, book.chapters.length - 1);
+    }
+  }
+  renderChapter(startChapter);
 }
 
 async function loadDemoBookFromUrl() {

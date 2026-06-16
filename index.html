@@ -31,12 +31,20 @@
         <section class="shelf-board">
           <div class="shelf-copy">
             <p class="drop-title">你的英文原著书架</p>
-            <p class="drop-copy">导入 EPUB 后进入沉浸式阅读。未来这里可以扩展搜索、社区、书摘和学习记录。</p>
+            <p class="drop-copy">导入 EPUB 后会保存到本机浏览器书架；再次打开会恢复上次阅读位置。</p>
           </div>
           <button id="openSample" class="book-tile" type="button">
             <span>A Small Door in the Rain</span>
             <small>样书 · 点击打开</small>
           </button>
+        </section>
+
+        <section class="bookshelf-section">
+          <div class="bookshelf-head">
+            <h2>本机书架</h2>
+            <small>保存在当前浏览器 IndexedDB 中</small>
+          </div>
+          <div id="shelfBooks" class="bookshelf-list"></div>
         </section>
       </section>
 
@@ -100,20 +108,11 @@
               <input id="rateControl" type="range" min="0.65" max="1.25" value="0.9" step="0.05" />
             </label>
             <label>
-              声音
+              音色
               <select id="voiceSelect"></select>
             </label>
-            <label>
-              朗读风格
-              <select id="styleSelect">
-                <option value="calm">沉浸旁白</option>
-                <option value="dramatic">戏剧化</option>
-                <option value="slow">慢速精读</option>
-                <option value="dialogue">对白感</option>
-              </select>
-            </label>
           </div>
-          <p class="settings-note" id="coachNote">旁白模式：适合小说叙述段落，语速稳定，停顿更清楚。</p>
+          <p class="settings-note" id="coachNote">选择音色后，生成的音频会按句子缓存；再次播放同一句会优先使用本地缓存。</p>
         </aside>
 
         <aside id="wordPanel" class="word-panel collapsed">

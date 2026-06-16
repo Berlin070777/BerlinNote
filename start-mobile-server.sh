@@ -18,6 +18,13 @@ fi
 
 cd "$DIR"
 
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 NODE_BIN="${NODE_BIN:-}"
 if [ -z "$NODE_BIN" ]; then
   if command -v node >/dev/null 2>&1; then
