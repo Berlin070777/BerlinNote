@@ -66,6 +66,15 @@ export DOUBAO_VOICE_TYPE="你的音色 ID"
 ./start-mobile-server.sh
 ```
 
+代码会按双向 WebSocket 的旧版控制台格式发送请求头：
+
+```text
+X-Api-App-Key: APP ID
+X-Api-Access-Key: Access Token
+X-Api-Resource-Id: seed-tts-2.0
+X-Api-Connect-Id: 自动生成的 UUID
+```
+
 新版控制台，如果你拿到的是 API Key：
 
 ```bash
@@ -75,6 +84,22 @@ export DOUBAO_RESOURCE_ID="seed-tts-2.0"
 export DOUBAO_VOICE_TYPE="你的音色 ID"
 ./start-mobile-server.sh
 ```
+
+代码会按新版格式发送：
+
+```text
+X-Api-Key: API Key
+X-Api-Resource-Id: seed-tts-2.0
+X-Api-Connect-Id: 自动生成的 UUID
+```
+
+当前 BerlinNote 的豆包双向 WebSocket 调用规则：
+
+- 旧版控制台：使用 `X-Api-App-Key`，不是 `X-Api-App-Id`。
+- 旧版控制台：使用 `X-Api-Access-Key` 传 Access Token。
+- 新版控制台：使用 `X-Api-Key`。
+- 两种方式都必须带 `X-Api-Resource-Id` 和 `X-Api-Connect-Id`。
+- 当前代码不会给豆包分支发送 `Authorization: Bearer ...` 或 `Authorization: Bearer;...`。
 
 `DOUBAO_VOICE_TYPE` 是文档里的 `<voice_type>`。注意：`DOUBAO_RESOURCE_ID` 必须和音色所属模型匹配；如果使用 `seed-tts-2.0`，请在豆包音色列表里选择明确属于 TTS 2.0 的音色，不要使用 TTS 1.0 示例音色。实际做英文原著阅读时，建议选择适合英文或中英混读的 2.0 音色。
 

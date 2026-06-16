@@ -65,7 +65,10 @@ server.listen(port, bindHost, () => {
   console.log("iPhone / iPad: use the LAN address printed by start-mobile-server.sh");
   console.log(`AI TTS provider: ${ttsProvider}`);
   console.log(`AI TTS: ${ttsProvider === "doubao" ? (hasDoubaoAuth() ? "enabled" : "disabled, set DOUBAO credentials") : (apiKey ? "enabled" : "disabled, set OPENAI_API_KEY")}`);
-  if (ttsProvider === "doubao") console.log(`Doubao resource: ${doubao.resourceId}, voice: ${doubao.voiceType}`);
+  if (ttsProvider === "doubao") {
+    console.log(`Doubao resource: ${doubao.resourceId}, voice: ${doubao.voiceType}`);
+    console.log(`Doubao auth: ${doubao.apiKey ? "X-Api-Key" : "X-Api-App-Key"}, token ${maskToken(doubao.apiKey || doubao.accessKey)}`);
+  }
   console.log(`Audio cache: ${cacheDir}`);
   console.log("");
 });
@@ -211,28 +214,40 @@ function enhanceDoubaoError(message) {
   if (/unauthorized|401/i.test(message)) {
     return [
       message,
-      "Fix: Doubao bidirectional WebSocket does not use Authorization: Bearer.",
-      "Use old console headers DOUBAO_APP_ID + DOUBAO_ACCESS_KEY, or new console DOUBAO_API_KEY."
+      "Fix: Doubao bidirectional WebSocket auth headers must match the console version.",
+      "Old console: X-Api-App-Key + X-Api-Access-Key + X-Api-Resource-Id + X-Api-Connect-Id.",
+      "New console: X-Api-Key + X-Api-Resource-Id + X-Api-Connect-Id.",
+      "Check token validity, model authorization, and proxy/firewall settings."
     ].join("\n");
   }
   return message;
 }
 
 function buildDoubaoHeaders() {
-  const headers = {
-    "X-Api-Resource-Id": doubao.resourceId
-  };
+  const connectId = randomUUID();
   if (doubao.apiKey) {
-    headers["X-Api-Key"] = doubao.apiKey;
-  } else {
-    headers["X-Api-App-Id"] = doubao.appId;
-    headers["X-Api-Access-Key"] = doubao.accessKey;
+    return {
+      "X-Api-Key": doubao.apiKey.trim(),
+      "X-Api-Resource-Id": doubao.resourceId,
+      "X-Api-Connect-Id": connectId
+    };
   }
-  return headers;
+  return {
+    "X-Api-App-Key": doubao.appId.trim(),
+    "X-Api-Access-Key": doubao.accessKey.trim(),
+    "X-Api-Resource-Id": doubao.resourceId,
+    "X-Api-Connect-Id": connectId
+  };
 }
 
 function hasDoubaoAuth() {
-  return Boolean(doubao.apiKey || (doubao.appId && doubao.accessKey));
+  return Boolean(doubao.apiKey.trim() || (doubao.appId.trim() && doubao.accessKey.trim()));
+}
+
+function maskToken(token) {
+  token = String(token || "");
+  if (token.length <= 8) return token ? "****" : "missing";
+  return `${token.slice(0, 4)}...${token.slice(-4)}`;
 }
 
 function buildDoubaoStartSessionPayload(text, style, rate) {
