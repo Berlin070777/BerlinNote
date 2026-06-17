@@ -324,6 +324,32 @@ h2 {
   font-weight: 900;
 }
 
+.chapter-end-nav {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+  gap: 12px;
+  margin: 46px 0 max(32px, env(safe-area-inset-bottom));
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+
+.chapter-end-nav button {
+  min-height: 46px;
+  border-radius: 8px;
+  font-size: 0.92rem;
+  font-weight: 900;
+}
+
+.chapter-end-nav .primary-next {
+  background: var(--accent);
+  color: #fff;
+}
+
+.chapter-end-nav button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .drawer,
 .settings-panel,
 .word-panel {

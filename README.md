@@ -66,30 +66,11 @@ export OPENAI_API_KEY="你的 key"
 
 ### 使用豆包语音
 
-旧版控制台，也就是你截图里的 `APP ID + Access Token`：
+新版控制台推荐用 `API Key`。这是豆包双向 WebSocket V3 文档推荐的鉴权方式：
 
 ```bash
 export TTS_PROVIDER=doubao
-export DOUBAO_APP_ID="你的 APP ID"
-export DOUBAO_ACCESS_KEY="你的 Access Token"
-export DOUBAO_RESOURCE_ID="seed-tts-2.0"
-export DOUBAO_VOICE_TYPE="你的音色 ID"
-./start-mobile-server.sh
-```
-
-代码会按双向 WebSocket 的旧版控制台格式发送请求头：
-
-```text
-X-Api-App-Key: APP ID
-X-Api-Access-Key: Access Token
-X-Api-Resource-Id: seed-tts-2.0
-X-Api-Connect-Id: 自动生成的 UUID
-```
-
-新版控制台，如果你拿到的是 API Key：
-
-```bash
-export TTS_PROVIDER=doubao
+export DOUBAO_AUTH_MODE=api-key
 export DOUBAO_API_KEY="你的 API Key"
 export DOUBAO_RESOURCE_ID="seed-tts-2.0"
 export DOUBAO_VOICE_TYPE="你的音色 ID"
@@ -104,11 +85,38 @@ X-Api-Resource-Id: seed-tts-2.0
 X-Api-Connect-Id: 自动生成的 UUID
 ```
 
+如果你还在用旧版控制台，也就是 `APP ID + Access Token`，可以这样配置：
+
+```bash
+export TTS_PROVIDER=doubao
+export DOUBAO_AUTH_MODE=access-token
+export DOUBAO_APP_ID="你的 APP ID"
+export DOUBAO_ACCESS_KEY="你的 Access Token"
+export DOUBAO_RESOURCE_ID="seed-tts-2.0"
+export DOUBAO_VOICE_TYPE="你的音色 ID"
+./start-mobile-server.sh
+```
+
+旧版模式默认发送：
+
+```text
+X-Api-App-Key: APP ID
+X-Api-Access-Key: Access Token
+X-Api-Resource-Id: seed-tts-2.0
+X-Api-Connect-Id: 自动生成的 UUID
+```
+
+如果旧版控制台鉴权失败，而文档或控制台要求 `X-Api-App-Id`，在 `.env` 里加一行即可切换：
+
+```bash
+DOUBAO_LEGACY_APP_HEADER=X-Api-App-Id
+```
+
 当前 BerlinNote 的豆包双向 WebSocket 调用规则：
 
-- 旧版控制台：使用 `X-Api-App-Key`，不是 `X-Api-App-Id`。
-- 旧版控制台：使用 `X-Api-Access-Key` 传 Access Token。
-- 新版控制台：使用 `X-Api-Key`。
+- `DOUBAO_AUTH_MODE=api-key`：只使用 `X-Api-Key`，不发送 APP ID 和 Access Token。
+- `DOUBAO_AUTH_MODE=access-token`：使用 `DOUBAO_APP_ID + DOUBAO_ACCESS_KEY`。
+- `DOUBAO_AUTH_MODE=auto` 或不写：优先使用 `DOUBAO_API_KEY`；没有 API Key 时再使用旧版 `APP ID + Access Token`。
 - 两种方式都必须带 `X-Api-Resource-Id` 和 `X-Api-Connect-Id`。
 - 当前代码不会给豆包分支发送 `Authorization: Bearer ...` 或 `Authorization: Bearer;...`。
 

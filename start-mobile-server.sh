@@ -47,9 +47,9 @@ if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/
   echo "BerlinNote is already running on port ${PORT}."
   echo ""
   echo "Open:"
-  echo "  http://localhost:${PORT}/?v=server-import-5"
+  echo "  http://localhost:${PORT}/?v=server-import-9"
   if [ -n "$IP" ]; then
-    echo "  http://${IP}:${PORT}/?v=server-import-5"
+    echo "  http://${IP}:${PORT}/?v=server-import-9"
   fi
   echo ""
   echo "If you want to restart it, stop the old terminal with Ctrl+C first."

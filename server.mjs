@@ -17,9 +17,11 @@ const bindHost = process.env.BIND_HOST || "0.0.0.0";
 const apiKey = process.env.OPENAI_API_KEY || "";
 const ttsProvider = (process.env.TTS_PROVIDER || "openai").toLowerCase();
 const doubao = {
+  authMode: (process.env.DOUBAO_AUTH_MODE || "auto").toLowerCase(),
   apiKey: process.env.DOUBAO_API_KEY || "",
   appId: process.env.DOUBAO_APP_ID || "",
   accessKey: process.env.DOUBAO_ACCESS_KEY || "",
+  legacyAppHeader: process.env.DOUBAO_LEGACY_APP_HEADER || "X-Api-App-Key",
   resourceId: process.env.DOUBAO_RESOURCE_ID || "seed-tts-2.0",
   voiceType: process.env.DOUBAO_VOICE_TYPE || "zh_female_vv_uranus_bigtts"
 };
@@ -85,8 +87,9 @@ server.listen(port, bindHost, () => {
   console.log(`AI TTS provider: ${ttsProvider}`);
   console.log(`AI TTS: ${ttsProvider === "doubao" ? (hasDoubaoAuth() ? "enabled" : "disabled, set DOUBAO credentials") : (apiKey ? "enabled" : "disabled, set OPENAI_API_KEY")}`);
   if (ttsProvider === "doubao") {
+    const auth = getDoubaoAuthConfig();
     console.log(`Doubao resource: ${doubao.resourceId}, voice: ${doubao.voiceType}`);
-    console.log(`Doubao auth: ${doubao.apiKey ? "X-Api-Key" : "X-Api-App-Key"}, token ${maskToken(doubao.apiKey || doubao.accessKey)}`);
+    console.log(`Doubao auth: ${auth.label}, token ${maskToken(auth.secret)}`);
   }
   console.log(`Audio cache: ${cacheDir}`);
   console.log(`Books folder: ${booksDir}`);
@@ -214,7 +217,7 @@ async function handleTts(req, res) {
   console.log(`[audio-cache] miss ${key}`);
 
   if (ttsProvider === "doubao" && !hasDoubaoAuth()) {
-    sendJson(res, 503, { error: "Doubao TTS is not configured. Set DOUBAO_APP_ID and DOUBAO_ACCESS_KEY, or DOUBAO_API_KEY." });
+    sendJson(res, 503, { error: `Doubao TTS is not configured. ${getDoubaoMissingMessage()}` });
     return;
   }
 
@@ -329,33 +332,104 @@ function enhanceDoubaoError(message) {
     return [
       message,
       "Fix: Doubao bidirectional WebSocket auth headers must match the console version.",
-      "Old console: X-Api-App-Key + X-Api-Access-Key + X-Api-Resource-Id + X-Api-Connect-Id.",
-      "New console: X-Api-Key + X-Api-Resource-Id + X-Api-Connect-Id.",
-      "Check token validity, model authorization, and proxy/firewall settings."
+      "New console: set DOUBAO_AUTH_MODE=api-key and DOUBAO_API_KEY, then BerlinNote sends X-Api-Key + X-Api-Resource-Id + X-Api-Connect-Id.",
+      "Old console: set DOUBAO_AUTH_MODE=access-token, DOUBAO_APP_ID and DOUBAO_ACCESS_KEY.",
+      "If old-console auth fails, try DOUBAO_LEGACY_APP_HEADER=X-Api-App-Id or X-Api-App-Key according to the console/document version.",
+      "Also check token validity, model authorization, and proxy/firewall settings."
     ].join("\n");
   }
   return message;
 }
 
 function buildDoubaoHeaders() {
+  const auth = getDoubaoAuthConfig();
+  if (!auth.ready) {
+    throw new Error(`Doubao auth is incomplete. ${getDoubaoMissingMessage()}`);
+  }
+
   const connectId = randomUUID();
-  if (doubao.apiKey) {
+  if (auth.mode === "api-key") {
     return {
-      "X-Api-Key": doubao.apiKey.trim(),
+      "X-Api-Key": auth.apiKey,
       "X-Api-Resource-Id": doubao.resourceId,
       "X-Api-Connect-Id": connectId
     };
   }
+
   return {
-    "X-Api-App-Key": doubao.appId.trim(),
-    "X-Api-Access-Key": doubao.accessKey.trim(),
+    [getDoubaoLegacyAppHeader()]: auth.appId,
+    "X-Api-Access-Key": auth.accessKey,
     "X-Api-Resource-Id": doubao.resourceId,
     "X-Api-Connect-Id": connectId
   };
 }
 
 function hasDoubaoAuth() {
-  return Boolean(doubao.apiKey.trim() || (doubao.appId.trim() && doubao.accessKey.trim()));
+  return getDoubaoAuthConfig().ready;
+}
+
+function getDoubaoAuthConfig() {
+  const mode = normalizeDoubaoAuthMode(doubao.authMode);
+  const apiKeyValue = doubao.apiKey.trim();
+  const appIdValue = doubao.appId.trim();
+  const accessKeyValue = doubao.accessKey.trim();
+
+  if (mode === "api-key") {
+    return {
+      mode,
+      ready: Boolean(apiKeyValue),
+      label: "X-Api-Key",
+      secret: apiKeyValue,
+      apiKey: apiKeyValue
+    };
+  }
+
+  if (mode === "access-token") {
+    return {
+      mode,
+      ready: Boolean(appIdValue && accessKeyValue),
+      label: `${getDoubaoLegacyAppHeader()} + X-Api-Access-Key`,
+      secret: accessKeyValue,
+      appId: appIdValue,
+      accessKey: accessKeyValue
+    };
+  }
+
+  if (apiKeyValue) {
+    return {
+      mode: "api-key",
+      ready: true,
+      label: "X-Api-Key",
+      secret: apiKeyValue,
+      apiKey: apiKeyValue
+    };
+  }
+
+  return {
+    mode: "access-token",
+    ready: Boolean(appIdValue && accessKeyValue),
+    label: `${getDoubaoLegacyAppHeader()} + X-Api-Access-Key`,
+    secret: accessKeyValue,
+    appId: appIdValue,
+    accessKey: accessKeyValue
+  };
+}
+
+function normalizeDoubaoAuthMode(mode) {
+  if (["auto", "api-key", "access-token"].includes(mode)) return mode;
+  return "auto";
+}
+
+function getDoubaoLegacyAppHeader() {
+  const header = doubao.legacyAppHeader.trim();
+  return header === "X-Api-App-Id" ? "X-Api-App-Id" : "X-Api-App-Key";
+}
+
+function getDoubaoMissingMessage() {
+  const mode = normalizeDoubaoAuthMode(doubao.authMode);
+  if (mode === "api-key") return "Set DOUBAO_API_KEY, or switch DOUBAO_AUTH_MODE to auto/access-token.";
+  if (mode === "access-token") return "Set DOUBAO_APP_ID and DOUBAO_ACCESS_KEY, or switch DOUBAO_AUTH_MODE to auto/api-key.";
+  return "Set DOUBAO_API_KEY for new-console API Key auth, or set DOUBAO_APP_ID and DOUBAO_ACCESS_KEY for old-console auth.";
 }
 
 function maskToken(token) {
@@ -524,7 +598,7 @@ function openRawWebSocket(urlString, extraHeaders) {
         if (end === -1) return;
         const head = handshake.subarray(0, end).toString("utf8");
         if (!head.includes(" 101 ")) {
-          rejectSocket(new Error(`Doubao websocket handshake failed: ${head.split("\r\n")[0]}`));
+          rejectSocket(new Error(enhanceDoubaoError(`Doubao websocket handshake failed: ${head.split("\r\n")[0]}`)));
           socket.end();
           return;
         }
@@ -636,7 +710,7 @@ async function renderIndexHtml(filePath) {
   const markup = books.length
     ? books
         .map(
-          (book) => `<a class="saved-book" href="./?folderBook=${encodeURIComponent(book.id)}&v=server-import-7"><strong>${escapeHtml(book.title)}</strong><span>本地 books 文件夹 · ${formatBytes(book.size)}</span></a>`
+          (book) => `<a class="saved-book" href="./?folderBook=${encodeURIComponent(book.id)}&v=server-import-9"><strong>${escapeHtml(book.title)}</strong><span>本地 books 文件夹 · ${formatBytes(book.size)}</span></a>`
         )
         .join("")
     : `<div class="empty-bookshelf">还没有书籍。可以导入 EPUB，或者把 EPUB 放进 books 文件夹。</div>`;

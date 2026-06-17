@@ -21,7 +21,12 @@ const state = {
   systemVoices: [],
   queue: [],
   queueIndex: 0,
-  isContinuous: false
+  isContinuous: false,
+  prefetchToken: 0,
+  prefetchCache: new Map(),
+  prefetchInFlight: new Map(),
+  prefetchWindowSize: 3,
+  prefetchMaxConcurrency: 2
 };
 
 const els = {
@@ -219,6 +224,7 @@ function renderChapter(index, options = {}) {
     p.append(paragraphButton);
     els.content.append(p);
   });
+  els.content.append(createChapterEndNav(index));
 
   renderChapterList();
   if (state.restoreProgress?.chapterIndex === index) {
@@ -233,6 +239,28 @@ function renderChapter(index, options = {}) {
   } else {
     scheduleProgressSave();
   }
+}
+
+function createChapterEndNav(index) {
+  const nav = document.createElement("nav");
+  nav.className = "chapter-end-nav";
+  nav.setAttribute("aria-label", "章节切换");
+
+  const prev = document.createElement("button");
+  prev.type = "button";
+  prev.textContent = "上一章";
+  prev.disabled = index === 0;
+  prev.addEventListener("click", () => goChapter(index - 1));
+
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "primary-next";
+  next.textContent = index === state.book.chapters.length - 1 ? "已到最后一章" : "下一章";
+  next.disabled = index === state.book.chapters.length - 1;
+  next.addEventListener("click", () => goChapter(index + 1));
+
+  nav.append(prev, next);
+  return nav;
 }
 
 function selectSentence(el, text, autoplay = false) {
@@ -284,6 +312,8 @@ function playBook() {
   state.queue = items;
   state.queueIndex = findCurrentBookQueueIndex(items);
   state.isContinuous = true;
+  state.prefetchToken += 1;
+  prefetchAroundQueue(state.queueIndex + 1);
   speakNextBookItem();
 }
 
@@ -305,6 +335,8 @@ function playQueue(sentenceEls) {
   state.queue = sentenceEls.map((el) => ({ el, text: el.textContent.trim() }));
   state.queueIndex = 0;
   state.isContinuous = true;
+  state.prefetchToken += 1;
+  prefetchAroundQueue(state.queueIndex + 1);
   speakNextInQueue();
 }
 
@@ -315,6 +347,7 @@ function speakNextInQueue() {
     clearSpeaking();
     return;
   }
+  prefetchAroundQueue(state.queueIndex + 1);
   selectSentence(item.el, item.text, false);
   speakText(item.text, item.el, () => {
     state.queueIndex += 1;
@@ -338,6 +371,7 @@ function speakNextBookItem() {
     speakNextBookItem();
     return;
   }
+  prefetchAroundQueue(state.queueIndex + 1);
   selectSentence(el, item.text, false);
   speakText(item.text, el, () => {
     state.queueIndex += 1;
@@ -353,7 +387,7 @@ async function speakText(text, el, onEnd) {
   }
   markSpeaking(el);
   try {
-    const blob = await getCachedAiAudio(text);
+    const blob = await getPrefetchedAudio(text) || await getCachedAiAudio(text);
     if (playToken !== state.playToken) return;
     await playAudioBlob(blob, el, onEnd, playToken);
   } catch (error) {
@@ -362,6 +396,77 @@ async function speakText(text, el, onEnd) {
     else if (/not configured/i.test(error.message)) showToast("未配置 AI TTS，暂用系统语音。");
     else showToast("AI 音频不可用，暂用系统语音。");
     speakWithSystemVoice(text, el, onEnd, playToken);
+  }
+}
+
+async function getPrefetchedAudio(text) {
+  const request = buildAudioRequest(text);
+  const key = await audioCacheKey(request);
+  const blob = state.prefetchCache.get(key);
+  if (blob) {
+    state.prefetchCache.delete(key);
+    console.info("BerlinNote audio prefetch hit", key);
+    return blob;
+  }
+  const pending = state.prefetchInFlight.get(key);
+  if (!pending) return null;
+  try {
+    const pendingBlob = await pending;
+    if (state.prefetchCache.get(key) === pendingBlob) state.prefetchCache.delete(key);
+    console.info("BerlinNote audio prefetch awaited", key);
+    return pendingBlob;
+  } catch {
+    return null;
+  }
+}
+
+function prefetchAroundQueue(startIndex) {
+  if (!state.isContinuous || !state.queue.length) return;
+  const token = state.prefetchToken;
+  const candidates = [];
+  for (let index = startIndex; index < state.queue.length && candidates.length < state.prefetchWindowSize; index += 1) {
+    const text = state.queue[index]?.text?.trim();
+    if (text) candidates.push(text);
+  }
+  candidates.forEach((text) => prefetchAudioForText(text, token));
+}
+
+async function prefetchAudioForText(text, token) {
+  if (!navigator.onLine || token !== state.prefetchToken) return;
+  const request = buildAudioRequest(text);
+  const key = await audioCacheKey(request);
+  if (token !== state.prefetchToken || state.prefetchCache.has(key) || state.prefetchInFlight.has(key)) return;
+  if (state.prefetchInFlight.size >= state.prefetchMaxConcurrency) return;
+
+  const pending = getCachedAiAudio(text);
+  state.prefetchInFlight.set(key, pending);
+  try {
+    const blob = await pending;
+    if (token === state.prefetchToken && state.isContinuous) {
+      state.prefetchCache.set(key, blob);
+      trimPrefetchCache();
+    }
+  } catch (error) {
+    console.warn("Audio prefetch failed", error);
+  } finally {
+    state.prefetchInFlight.delete(key);
+    if (token === state.prefetchToken && state.isContinuous) {
+      prefetchAroundQueue(state.queueIndex + 1);
+    }
+  }
+}
+
+function clearPrefetch() {
+  state.prefetchToken += 1;
+  state.prefetchCache.clear();
+  state.prefetchInFlight.clear();
+}
+
+function trimPrefetchCache() {
+  const maxItems = Math.max(state.prefetchWindowSize * 2, 6);
+  while (state.prefetchCache.size > maxItems) {
+    const oldestKey = state.prefetchCache.keys().next().value;
+    state.prefetchCache.delete(oldestKey);
   }
 }
 
@@ -461,6 +566,7 @@ function stopSpeech() {
   state.queue = [];
   state.queueIndex = 0;
   state.playToken += 1;
+  clearPrefetch();
   stopPlaybackOnly();
 }
 
