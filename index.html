@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#f5f0e8" />
     <title>BerlinNote</title>
     <link rel="manifest" href="./manifest.webmanifest" />
-    <link rel="stylesheet" href="./styles.css?v=server-import-9" />
+    <link rel="stylesheet" href="./styles.css?v=server-import-12" />
   </head>
   <body>
     <main class="app">
@@ -65,6 +65,13 @@
             <button id="nextChapter" type="button">下一章</button>
           </div>
           <nav id="chapterList" class="chapter-list" aria-label="章节目录"></nav>
+          <section class="bookmark-section" aria-label="收藏位置">
+            <div class="bookmark-head">
+              <p class="eyebrow">Bookmarks</p>
+              <span id="bookmarkCount">0</span>
+            </div>
+            <div id="bookmarkList" class="bookmark-list"></div>
+          </section>
         </aside>
 
         <section class="reader">
@@ -74,6 +81,8 @@
             <div class="chapter-meta">
               <p id="chapterKicker">Chapter</p>
               <h2 id="chapterTitle">Select a chapter</h2>
+              <small id="readingProgress">阅读 0%</small>
+              <small id="audioCacheStatus" class="audio-cache-status">音频缓存待命</small>
             </div>
             <div class="toolbar-actions">
               <button id="playBook" class="icon-button" aria-label="朗读整本">▶︎</button>
@@ -131,6 +140,6 @@
     </main>
 
     <div id="toast" class="toast hidden" role="status"></div>
-    <script src="./app.js?v=server-import-9"></script>
+    <script src="./app.js?v=server-import-12"></script>
   </body>
 </html>

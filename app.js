@@ -26,7 +26,10 @@ const state = {
   prefetchCache: new Map(),
   prefetchInFlight: new Map(),
   prefetchWindowSize: 3,
-  prefetchMaxConcurrency: 2
+  prefetchMaxConcurrency: 2,
+  sentenceMap: [],
+  totalSentences: 0,
+  bookmarks: new Map()
 };
 
 const els = {
@@ -43,10 +46,14 @@ const els = {
   prevChapter: $("#prevChapter"),
   nextChapter: $("#nextChapter"),
   tocProgress: $("#tocProgress"),
+  bookmarkCount: $("#bookmarkCount"),
+  bookmarkList: $("#bookmarkList"),
   bookTitle: $("#bookTitle"),
   chapterList: $("#chapterList"),
   chapterKicker: $("#chapterKicker"),
   chapterTitle: $("#chapterTitle"),
+  readingProgress: $("#readingProgress"),
+  audioCacheStatus: $("#audioCacheStatus"),
   content: $("#chapterContent"),
   settingsPanel: $("#settingsPanel"),
   openSettings: $("#openSettings"),
@@ -117,7 +124,10 @@ els.voice.addEventListener("change", () => updateCoachNote());
 els.speakWord.addEventListener("click", () => speakWord(els.wordTitle.textContent));
 els.fontSize.addEventListener("input", updateReaderStyle);
 els.lineHeight.addEventListener("input", updateReaderStyle);
-els.content.addEventListener("scroll", () => scheduleProgressSave());
+els.content.addEventListener("scroll", () => {
+  updatePositionFromViewport();
+  scheduleProgressSave();
+});
 
 function openDrawer() {
   els.drawer.classList.add("open");
@@ -208,9 +218,11 @@ function renderChapter(index, options = {}) {
       span.className = "sentence";
       span.dataset.paragraphIndex = String(paragraphIndex);
       span.dataset.sentenceIndex = String(sentenceIndex);
+      span.dataset.bookmarkKey = bookmarkKey(index, paragraphIndex, sentenceIndex);
       appendSentenceTokens(span, sentence);
       span.addEventListener("click", () => selectSentence(span, sentence, true));
       p.append(span, " ");
+      p.append(createBookmarkButton(index, paragraphIndex, sentenceIndex, sentence));
     });
     const paragraphButton = document.createElement("button");
     paragraphButton.type = "button";
@@ -227,6 +239,8 @@ function renderChapter(index, options = {}) {
   els.content.append(createChapterEndNav(index));
 
   renderChapterList();
+  renderBookmarks();
+  updateReadingProgress();
   if (state.restoreProgress?.chapterIndex === index) {
     const progress = state.restoreProgress;
     state.restoreProgress = null;
@@ -239,6 +253,154 @@ function renderChapter(index, options = {}) {
   } else {
     scheduleProgressSave();
   }
+}
+
+function createBookmarkButton(chapterIndex, paragraphIndex, sentenceIndex, sentence) {
+  const button = document.createElement("button");
+  const key = bookmarkKey(chapterIndex, paragraphIndex, sentenceIndex);
+  button.type = "button";
+  button.className = `sentence-bookmark${state.bookmarks.has(key) ? " active" : ""}`;
+  button.dataset.bookmarkKey = key;
+  button.setAttribute("aria-label", state.bookmarks.has(key) ? "取消收藏此句" : "收藏此句");
+  button.textContent = state.bookmarks.has(key) ? "★" : "☆";
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleBookmark({ chapterIndex, paragraphIndex, sentenceIndex, text: sentence.trim() });
+  });
+  return button;
+}
+
+function buildSentenceMap(book) {
+  const items = [];
+  book.chapters.forEach((chapter, chapterIndex) => {
+    chapter.paragraphs.forEach((paragraph, paragraphIndex) => {
+      splitSentences(paragraph).forEach((sentence, sentenceIndex) => {
+        items.push({ chapterIndex, paragraphIndex, sentenceIndex, text: sentence.trim() });
+      });
+    });
+  });
+  return items;
+}
+
+function getCurrentProgressInfo() {
+  return getProgressInfoFor(state.chapterIndex, state.paragraphIndex, state.sentenceIndex);
+}
+
+function getProgressInfoFor(chapterIndex, paragraphIndex, sentenceIndex) {
+  const globalSentenceIndex = Math.max(
+    0,
+    state.sentenceMap.findIndex(
+      (item) =>
+        item.chapterIndex === chapterIndex &&
+        item.paragraphIndex === paragraphIndex &&
+        item.sentenceIndex === sentenceIndex
+    )
+  );
+  const totalSentences = state.totalSentences || state.sentenceMap.length || 1;
+  const percent = Math.min(100, Math.max(0, Math.round(((globalSentenceIndex + 1) / totalSentences) * 100)));
+  return { globalSentenceIndex, totalSentences, percent };
+}
+
+function updateReadingProgress() {
+  const progress = getCurrentProgressInfo();
+  if (els.readingProgress) els.readingProgress.textContent = `阅读 ${progress.percent}%`;
+  return progress;
+}
+
+function updatePositionFromViewport() {
+  const sentences = [...els.content.querySelectorAll(".sentence")];
+  if (!sentences.length) return;
+  const contentTop = els.content.getBoundingClientRect().top;
+  const best = sentences.find((sentence) => sentence.getBoundingClientRect().bottom > contentTop + 64) || sentences[0];
+  state.paragraphIndex = Number(best.dataset.paragraphIndex || 0);
+  state.sentenceIndex = Number(best.dataset.sentenceIndex || 0);
+  updateReadingProgress();
+}
+
+function bookmarkKey(chapterIndex, paragraphIndex, sentenceIndex) {
+  return `${state.bookId}:${chapterIndex}:${paragraphIndex}:${sentenceIndex}`;
+}
+
+async function toggleBookmark(item) {
+  if (!state.bookId) return;
+  const key = bookmarkKey(item.chapterIndex, item.paragraphIndex, item.sentenceIndex);
+  if (state.bookmarks.has(key)) {
+    state.bookmarks.delete(key);
+    await libraryStore.deleteBookmark(key);
+    showToast("已取消收藏。");
+  } else {
+    const progress = getProgressInfoFor(item.chapterIndex, item.paragraphIndex, item.sentenceIndex);
+    const chapter = state.book.chapters[item.chapterIndex];
+    const bookmark = {
+      key,
+      bookId: state.bookId,
+      chapterIndex: item.chapterIndex,
+      paragraphIndex: item.paragraphIndex,
+      sentenceIndex: item.sentenceIndex,
+      chapterTitle: chapter?.title || `Chapter ${item.chapterIndex + 1}`,
+      text: item.text.slice(0, 180),
+      percent: progress.percent,
+      createdAt: Date.now()
+    };
+    state.bookmarks.set(key, bookmark);
+    await libraryStore.saveBookmark(bookmark);
+    showToast("已收藏当前位置。");
+  }
+  updateBookmarkButtons();
+  renderBookmarks();
+}
+
+function updateBookmarkButtons() {
+  els.content.querySelectorAll(".sentence-bookmark").forEach((button) => {
+    const active = state.bookmarks.has(button.dataset.bookmarkKey);
+    button.classList.toggle("active", active);
+    button.textContent = active ? "★" : "☆";
+    button.setAttribute("aria-label", active ? "取消收藏此句" : "收藏此句");
+  });
+}
+
+function renderBookmarks() {
+  if (!els.bookmarkList) return;
+  const bookmarks = [...state.bookmarks.values()].sort((a, b) => {
+    if (a.chapterIndex !== b.chapterIndex) return a.chapterIndex - b.chapterIndex;
+    if (a.paragraphIndex !== b.paragraphIndex) return a.paragraphIndex - b.paragraphIndex;
+    return a.sentenceIndex - b.sentenceIndex;
+  });
+  els.bookmarkCount.textContent = String(bookmarks.length);
+  els.bookmarkList.replaceChildren();
+  if (!bookmarks.length) {
+    const empty = document.createElement("p");
+    empty.className = "bookmark-empty";
+    empty.textContent = "还没有收藏。";
+    els.bookmarkList.append(empty);
+    return;
+  }
+  bookmarks.forEach((bookmark) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "bookmark-item";
+    const title = document.createElement("strong");
+    title.textContent = bookmark.chapterTitle || `Chapter ${bookmark.chapterIndex + 1}`;
+    const text = document.createElement("span");
+    text.textContent = bookmark.text;
+    const meta = document.createElement("small");
+    meta.textContent = `阅读 ${bookmark.percent || 0}%`;
+    button.append(title, text, meta);
+    button.addEventListener("click", () => jumpToBookmark(bookmark));
+    els.bookmarkList.append(button);
+  });
+}
+
+function jumpToBookmark(bookmark) {
+  closePanels();
+  renderChapter(bookmark.chapterIndex, { preserveSpeech: false });
+  requestAnimationFrame(() => {
+    const selector = `.sentence[data-paragraph-index="${bookmark.paragraphIndex}"][data-sentence-index="${bookmark.sentenceIndex}"]`;
+    const el = els.content.querySelector(selector);
+    if (!el) return;
+    selectSentence(el, el.textContent.trim(), false);
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+  });
 }
 
 function createChapterEndNav(index) {
@@ -273,6 +435,7 @@ function selectSentence(el, text, autoplay = false) {
   el.classList.add("selected");
   el.closest("p")?.classList.add("active-paragraph");
   updateCoachNote();
+  updateReadingProgress();
   scheduleProgressSave();
   if (autoplay) speakSelected();
 }
@@ -345,6 +508,7 @@ function speakNextInQueue() {
   if (!item) {
     state.isContinuous = false;
     clearSpeaking();
+    scheduleProgressSave();
     return;
   }
   prefetchAroundQueue(state.queueIndex + 1);
@@ -360,6 +524,7 @@ function speakNextBookItem() {
   if (!item) {
     state.isContinuous = false;
     clearSpeaking();
+    scheduleProgressSave();
     return;
   }
   if (item.chapterIndex !== state.chapterIndex) renderChapter(item.chapterIndex, { preserveSpeech: true });
@@ -387,11 +552,17 @@ async function speakText(text, el, onEnd) {
   }
   markSpeaking(el);
   try {
-    const blob = await getPrefetchedAudio(text) || await getCachedAiAudio(text);
+    setAudioCacheStatus("正在读取音频缓存...");
+    const audio = await getPrefetchedAudio(text) || await getCachedAiAudio(text);
     if (playToken !== state.playToken) return;
-    await playAudioBlob(blob, el, onEnd, playToken);
+    if (!(audio.blob instanceof Blob)) throw new Error("Audio playback failed: invalid cached blob");
+    setAudioCacheStatus(formatAudioSource(audio.source));
+    await playAudioBlob(audio.blob, el, onEnd, playToken);
   } catch (error) {
     if (playToken !== state.playToken) return;
+    const recovered = await retryAiAudioAfterPlaybackFailure(text, el, onEnd, playToken, error);
+    if (recovered) return;
+    setAudioCacheStatus("AI 音频不可用");
     if (!navigator.onLine) showToast("离线且没有这句缓存，改用系统语音。");
     else if (/not configured/i.test(error.message)) showToast("未配置 AI TTS，暂用系统语音。");
     else showToast("AI 音频不可用，暂用系统语音。");
@@ -399,22 +570,42 @@ async function speakText(text, el, onEnd) {
   }
 }
 
+async function retryAiAudioAfterPlaybackFailure(text, el, onEnd, playToken, error) {
+  if (!/Audio playback failed|not supported|decode|media|blob|object url|overload/i.test(String(error?.message || error))) return false;
+  try {
+    const request = buildAudioRequest(text);
+    const key = await audioCacheKey(request);
+    await audioCache.delete(key);
+    state.prefetchCache.delete(key);
+    state.prefetchInFlight.delete(key);
+    setAudioCacheStatus("音频缓存损坏，正在重新读取...");
+    const audio = await getCachedAiAudio(text, { skipBrowserCache: true });
+    if (playToken !== state.playToken) return true;
+    setAudioCacheStatus(formatAudioSource(audio.source));
+    await playAudioBlob(audio.blob, el, onEnd, playToken);
+    return true;
+  } catch (retryError) {
+    console.warn("Audio retry failed", retryError);
+    return false;
+  }
+}
+
 async function getPrefetchedAudio(text) {
   const request = buildAudioRequest(text);
   const key = await audioCacheKey(request);
-  const blob = state.prefetchCache.get(key);
-  if (blob) {
+  const audio = state.prefetchCache.get(key);
+  if (audio) {
     state.prefetchCache.delete(key);
     console.info("BerlinNote audio prefetch hit", key);
-    return blob;
+    return { blob: audio.blob, source: "prefetch" };
   }
   const pending = state.prefetchInFlight.get(key);
   if (!pending) return null;
   try {
-    const pendingBlob = await pending;
-    if (state.prefetchCache.get(key) === pendingBlob) state.prefetchCache.delete(key);
+    const pendingAudio = await pending;
+    if (state.prefetchCache.get(key) === pendingAudio) state.prefetchCache.delete(key);
     console.info("BerlinNote audio prefetch awaited", key);
-    return pendingBlob;
+    return { blob: pendingAudio.blob, source: "prefetch" };
   } catch {
     return null;
   }
@@ -441,9 +632,9 @@ async function prefetchAudioForText(text, token) {
   const pending = getCachedAiAudio(text);
   state.prefetchInFlight.set(key, pending);
   try {
-    const blob = await pending;
+    const audio = await pending;
     if (token === state.prefetchToken && state.isContinuous) {
-      state.prefetchCache.set(key, blob);
+      state.prefetchCache.set(key, audio);
       trimPrefetchCache();
     }
   } catch (error) {
@@ -470,16 +661,18 @@ function trimPrefetchCache() {
   }
 }
 
-async function getCachedAiAudio(text) {
+async function getCachedAiAudio(text, options = {}) {
   const request = buildAudioRequest(text);
   const key = await audioCacheKey(request);
-  const cached = await withTimeout(audioCache.get(key), 500, "Audio IndexedDB read timeout").catch((error) => {
-    console.warn("Audio cache read skipped", error);
-    return null;
-  });
+  const cached = options.skipBrowserCache
+    ? null
+    : await withTimeout(audioCache.get(key), 500, "Audio IndexedDB read timeout").catch((error) => {
+        console.warn("Audio cache read skipped", error);
+        return null;
+      });
   if (cached) {
     console.info("BerlinNote audio cache hit", key);
-    return cached;
+    return { blob: normalizeAudioBlob(cached), source: "browser" };
   }
   if (!navigator.onLine) throw new Error("Offline and no cached audio");
 
@@ -492,12 +685,41 @@ async function getCachedAiAudio(text) {
     const message = await response.text();
     throw new Error(message);
   }
-  const blob = await response.blob();
-  await withTimeout(audioCache.set(key, blob, request), 700, "Audio IndexedDB write timeout").catch((error) => {
+  const blob = normalizeAudioBlob(await response.blob());
+  await withTimeout(audioCache.set(key, blob, buildAudioMeta(request)), 700, "Audio IndexedDB write timeout").catch((error) => {
     console.warn("Audio cache write skipped", error);
   });
-  console.info("BerlinNote audio fetched", response.headers.get("X-Audio-Cache") || "network", key);
-  return blob;
+  const source = response.headers.get("X-Audio-Cache") || "network";
+  console.info("BerlinNote audio fetched", source, key);
+  return { blob, source };
+}
+
+function normalizeAudioBlob(blob) {
+  if (blob?.type === "audio/mpeg") return blob;
+  return new Blob([blob], { type: "audio/mpeg" });
+}
+
+function buildAudioMeta(request) {
+  return {
+    ...request,
+    bookId: state.bookId,
+    chapterIndex: state.chapterIndex,
+    paragraphIndex: state.paragraphIndex,
+    sentenceIndex: state.sentenceIndex,
+    cachedAt: Date.now()
+  };
+}
+
+function formatAudioSource(source) {
+  if (source === "browser") return "音频：浏览器本地缓存";
+  if (source === "disk") return "音频：本地音频库命中";
+  if (source === "generated") return "音频：首次生成并已缓存";
+  if (source === "prefetch") return "音频：预加载缓存命中";
+  return "音频：已缓存";
+}
+
+function setAudioCacheStatus(text) {
+  if (els.audioCacheStatus) els.audioCacheStatus.textContent = text;
 }
 
 function buildAudioRequest(text) {
@@ -797,26 +1019,33 @@ async function renderSavedBooks() {
       els.shelfBooks.append(statusLine("还没有书籍。可以导入 EPUB，或者把 EPUB 放进 books 文件夹。"));
       return;
     }
+    const savedById = new Map(books.map((book) => [book.id, book]));
     folderBooks.forEach((book) => {
+      const saved = savedById.get(`folder-${book.id}`);
       const button = document.createElement("button");
       button.type = "button";
       button.className = "saved-book";
       const title = document.createElement("strong");
-      title.textContent = book.title || book.fileName || "Untitled";
+      title.textContent = saved?.title || book.title || book.fileName || "Untitled";
       const meta = document.createElement("span");
-      meta.textContent = `本地 books 文件夹 · ${formatFileSize(book.size)}`;
+      const progress = saved?.progress?.chapterIndex != null
+        ? `上次读到第 ${saved.progress.chapterIndex + 1} 章 · ${saved.progress.percent || 0}%`
+        : `本地 books 文件夹 · ${formatFileSize(book.size)}`;
+      meta.textContent = progress;
       button.append(title, meta);
       button.addEventListener("click", () => openFolderBook(book));
       els.shelfBooks.append(button);
     });
-    books.forEach((book) => {
+    books.filter((book) => !book.id.startsWith("folder-")).forEach((book) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "saved-book";
       const title = document.createElement("strong");
       title.textContent = book.title || book.fileName || "Untitled";
       const meta = document.createElement("span");
-      const progress = book.progress?.chapterIndex != null ? `上次读到第 ${book.progress.chapterIndex + 1} 章` : `${book.chapterCount || 0} 章`;
+      const progress = book.progress?.chapterIndex != null
+        ? `上次读到第 ${book.progress.chapterIndex + 1} 章 · ${book.progress.percent || 0}%`
+        : `${book.chapterCount || 0} 章`;
       meta.textContent = `${progress} · ${formatDate(book.updatedAt || book.createdAt)}`;
       button.append(title, meta);
       button.addEventListener("click", () => openSavedBook(book.id));
@@ -857,7 +1086,7 @@ async function openFolderBook(book) {
   await loadBook(null, book.title || book.fileName || "Untitled", {
     id: `folder-${book.id}`,
     parsedBook: data.parsedBook,
-    restore: false
+    restore: true
   });
   showToast("本地书库 EPUB 已打开。");
 }
@@ -876,13 +1105,20 @@ async function loadFolderBookFromUrl() {
   await loadBook(null, "Local Book", {
     id: `folder-${id}`,
     parsedBook: data.parsedBook,
-    restore: false
+    restore: true
   });
 }
 
 async function openSavedBook(id) {
-  const record = await libraryStore.getBook(id);
+  const record = await withTimeout(libraryStore.getBook(id), 1200, "IndexedDB 读取书籍超时").catch((error) => {
+    console.warn("Saved book read skipped", error);
+    return null;
+  });
   if (!record?.blob) {
+    if (id.startsWith("folder-")) {
+      await openFolderBook({ id: id.replace(/^folder-/, ""), title: record?.title || "Local Book" });
+      return;
+    }
     showToast("没有找到这本书的本地文件。");
     return;
   }
@@ -897,11 +1133,15 @@ function scheduleProgressSave() {
 
 async function saveCurrentProgress() {
   if (!state.bookId) return;
+  const progress = updateReadingProgress();
   await libraryStore.saveProgress(state.bookId, {
     chapterIndex: state.chapterIndex,
     paragraphIndex: state.paragraphIndex,
     sentenceIndex: state.sentenceIndex,
     scrollTop: els.content.scrollTop,
+    percent: progress.percent,
+    totalSentences: progress.totalSentences,
+    globalSentenceIndex: progress.globalSentenceIndex,
     updatedAt: Date.now()
   });
 }
@@ -944,6 +1184,14 @@ function createAudioCache() {
       } catch (error) {
         console.warn("Audio cache write failed", error);
       }
+    },
+    async delete(key) {
+      try {
+        const db = await dbPromise;
+        await idbRequest(db.transaction("audio", "readwrite").objectStore("audio").delete(key));
+      } catch (error) {
+        console.warn("Audio cache delete failed", error);
+      }
     }
   };
 }
@@ -954,13 +1202,15 @@ function createLibraryStore() {
     async saveBook(book) {
       const db = await dbPromise;
       const existing = await idbRequest(db.transaction("books", "readonly").objectStore("books").get(book.id));
+      const next = {
+        ...existing,
+        ...book,
+        progress: existing?.progress || book.progress || null,
+        updatedAt: Date.now()
+      };
+      if (book.blob === undefined && existing?.blob) next.blob = existing.blob;
       await idbRequest(
-        db.transaction("books", "readwrite").objectStore("books").put({
-          ...existing,
-          ...book,
-          progress: existing?.progress || book.progress || null,
-          updatedAt: Date.now()
-        })
+        db.transaction("books", "readwrite").objectStore("books").put(next)
       );
     },
     async listBooks() {
@@ -979,6 +1229,19 @@ function createLibraryStore() {
       record.progress = progress;
       record.updatedAt = progress.updatedAt || Date.now();
       await idbRequest(db.transaction("books", "readwrite").objectStore("books").put(record));
+    },
+    async listBookmarks(bookId) {
+      const db = await dbPromise;
+      const bookmarks = await idbRequest(db.transaction("bookmarks", "readonly").objectStore("bookmarks").getAll());
+      return bookmarks.filter((bookmark) => bookmark.bookId === bookId);
+    },
+    async saveBookmark(bookmark) {
+      const db = await dbPromise;
+      await idbRequest(db.transaction("bookmarks", "readwrite").objectStore("bookmarks").put(bookmark));
+    },
+    async deleteBookmark(key) {
+      const db = await dbPromise;
+      await idbRequest(db.transaction("bookmarks", "readwrite").objectStore("bookmarks").delete(key));
     }
   };
 }
@@ -989,7 +1252,7 @@ function openBerlinNoteDb() {
       rejectDb(new Error("IndexedDB unavailable"));
       return;
     }
-    const request = indexedDB.open("berlinnote-offline", 2);
+    const request = indexedDB.open("berlinnote-offline", 3);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains("audio")) {
@@ -1000,8 +1263,20 @@ function openBerlinNoteDb() {
         const books = db.createObjectStore("books", { keyPath: "id" });
         books.createIndex("updatedAt", "updatedAt");
       }
+      if (!db.objectStoreNames.contains("bookmarks")) {
+        const bookmarks = db.createObjectStore("bookmarks", { keyPath: "key" });
+        bookmarks.createIndex("bookId", "bookId");
+        bookmarks.createIndex("createdAt", "createdAt");
+      }
     };
-    request.onsuccess = () => resolveDb(request.result);
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onversionchange = () => db.close();
+      resolveDb(db);
+    };
+    request.onblocked = () => {
+      console.warn("IndexedDB upgrade is blocked by another BerlinNote tab. Close old tabs if local library restore stalls.");
+    };
     request.onerror = () => rejectDb(request.error);
   });
 }
@@ -1041,14 +1316,41 @@ async function loadBook(buffer, fallbackTitle = "Untitled", options = {}) {
   const book = options.parsedBook || await parseEpub(buffer);
   state.book = book;
   state.bookId = options.id || "";
+  state.sentenceMap = buildSentenceMap(book);
+  state.totalSentences = state.sentenceMap.length;
+  state.bookmarks = new Map();
   state.chapterIndex = 0;
   state.restoreProgress = null;
+  if (state.bookId) {
+    await withTimeout(
+      libraryStore.saveBook({
+        id: state.bookId,
+        title: book.title || fallbackTitle,
+        blob: buffer ? new Blob([buffer], { type: "application/epub+zip" }) : undefined,
+        chapterCount: book.chapters.length,
+        totalSentences: state.totalSentences,
+        createdAt: Date.now()
+      }),
+      900,
+      "IndexedDB save book timeout"
+    ).catch((error) => {
+      console.warn("Book metadata save skipped", error);
+    });
+    const bookmarks = await withTimeout(libraryStore.listBookmarks(state.bookId), 900, "IndexedDB bookmark list timeout").catch((error) => {
+      console.warn("Bookmark list skipped", error);
+      return [];
+    });
+    state.bookmarks = new Map(bookmarks.map((bookmark) => [bookmark.key, bookmark]));
+  }
   showReader();
   els.bookTitle.textContent = book.title || fallbackTitle;
   renderChapterList();
   let startChapter = 0;
   if (options.restore && state.bookId) {
-    const record = await libraryStore.getBook(state.bookId);
+    const record = await withTimeout(libraryStore.getBook(state.bookId), 900, "IndexedDB progress restore timeout").catch((error) => {
+      console.warn("Progress restore skipped", error);
+      return null;
+    });
     if (record?.progress) {
       state.restoreProgress = record.progress;
       startChapter = Math.min(record.progress.chapterIndex || 0, book.chapters.length - 1);

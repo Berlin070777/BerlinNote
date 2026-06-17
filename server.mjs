@@ -209,10 +209,13 @@ async function handleTts(req, res) {
   });
   const filePath = join(cacheDir, `${key}.mp3`);
 
-  if (await exists(filePath)) {
+  if (await isUsableAudioFile(filePath)) {
     console.log(`[audio-cache] hit ${key}`);
     sendAudio(res, filePath, key, "disk");
     return;
+  }
+  if (await exists(filePath)) {
+    console.warn(`[audio-cache] invalid ${key}, regenerating`);
   }
   console.log(`[audio-cache] miss ${key}`);
 
@@ -229,6 +232,9 @@ async function handleTts(req, res) {
   const audio = ttsProvider === "doubao"
     ? await generateDoubaoSpeech({ text, voice: doubaoVoice, rate })
     : await generateOpenAiSpeech({ text, voice: openAiVoice, rate });
+  if (!isUsableAudioBuffer(audio)) {
+    throw new Error(`AI TTS returned invalid audio (${audio.length} bytes)`);
+  }
   await writeFile(filePath, audio);
   console.log(`[audio-cache] stored ${key} (${audio.length} bytes)`);
   sendAudio(res, filePath, key, "generated");
@@ -260,7 +266,7 @@ async function generateOpenAiSpeech({ text, voice, rate }) {
 }
 
 async function generateDoubaoSpeech({ text, voice, rate }) {
-  const ws = await openRawWebSocket("wss://openspeech.bytedance.com/api/v3/tts/bidirection", buildDoubaoHeaders());
+  const ws = await openDoubaoWebSocket();
   const sessionId = randomUUID();
   const chunks = [];
 
@@ -341,8 +347,20 @@ function enhanceDoubaoError(message) {
   return message;
 }
 
-function buildDoubaoHeaders() {
+async function openDoubaoWebSocket() {
+  const endpoint = "wss://openspeech.bytedance.com/api/v3/tts/bidirection";
   const auth = getDoubaoAuthConfig();
+  try {
+    return await openRawWebSocket(endpoint, buildDoubaoHeaders({ auth }));
+  } catch (error) {
+    const fallbackHeader = getDoubaoFallbackLegacyHeader(auth);
+    if (!fallbackHeader || !/401|unauthorized/i.test(String(error?.message || error))) throw error;
+    console.warn(`Doubao auth failed with ${getDoubaoLegacyAppHeader()}, retrying with ${fallbackHeader}.`);
+    return openRawWebSocket(endpoint, buildDoubaoHeaders({ auth, legacyAppHeader: fallbackHeader }));
+  }
+}
+
+function buildDoubaoHeaders({ auth = getDoubaoAuthConfig(), legacyAppHeader = getDoubaoLegacyAppHeader() } = {}) {
   if (!auth.ready) {
     throw new Error(`Doubao auth is incomplete. ${getDoubaoMissingMessage()}`);
   }
@@ -357,7 +375,7 @@ function buildDoubaoHeaders() {
   }
 
   return {
-    [getDoubaoLegacyAppHeader()]: auth.appId,
+    [legacyAppHeader]: auth.appId,
     "X-Api-Access-Key": auth.accessKey,
     "X-Api-Resource-Id": doubao.resourceId,
     "X-Api-Connect-Id": connectId
@@ -370,9 +388,9 @@ function hasDoubaoAuth() {
 
 function getDoubaoAuthConfig() {
   const mode = normalizeDoubaoAuthMode(doubao.authMode);
-  const apiKeyValue = doubao.apiKey.trim();
-  const appIdValue = doubao.appId.trim();
-  const accessKeyValue = doubao.accessKey.trim();
+  const apiKeyValue = normalizeCredential(doubao.apiKey);
+  const appIdValue = normalizeCredential(doubao.appId);
+  const accessKeyValue = normalizeCredential(doubao.accessKey);
 
   if (mode === "api-key") {
     return {
@@ -423,6 +441,17 @@ function normalizeDoubaoAuthMode(mode) {
 function getDoubaoLegacyAppHeader() {
   const header = doubao.legacyAppHeader.trim();
   return header === "X-Api-App-Id" ? "X-Api-App-Id" : "X-Api-App-Key";
+}
+
+function getDoubaoFallbackLegacyHeader(auth) {
+  if (auth.mode !== "access-token") return "";
+  return getDoubaoLegacyAppHeader() === "X-Api-App-Key" ? "X-Api-App-Id" : "X-Api-App-Key";
+}
+
+function normalizeCredential(value) {
+  value = String(value || "").trim().replace(/^['"]|['"]$/g, "");
+  if (!value || /^your[_-]/i.test(value) || /^你的/.test(value)) return "";
+  return value;
 }
 
 function getDoubaoMissingMessage() {
@@ -710,7 +739,7 @@ async function renderIndexHtml(filePath) {
   const markup = books.length
     ? books
         .map(
-          (book) => `<a class="saved-book" href="./?folderBook=${encodeURIComponent(book.id)}&v=server-import-9"><strong>${escapeHtml(book.title)}</strong><span>本地 books 文件夹 · ${formatBytes(book.size)}</span></a>`
+          (book) => `<a class="saved-book" href="./?folderBook=${encodeURIComponent(book.id)}&v=server-import-12"><strong>${escapeHtml(book.title)}</strong><span>本地 books 文件夹 · ${formatBytes(book.size)}</span></a>`
         )
         .join("")
     : `<div class="empty-bookshelf">还没有书籍。可以导入 EPUB，或者把 EPUB 放进 books 文件夹。</div>`;
@@ -725,6 +754,24 @@ function sendAudio(res, filePath, key, cacheStatus) {
     "Cache-Control": "public, max-age=31536000, immutable"
   });
   createReadStream(filePath).pipe(res);
+}
+
+async function isUsableAudioFile(filePath) {
+  try {
+    const info = await stat(filePath);
+    if (info.size < 1024) return false;
+    const buffer = await readFile(filePath);
+    return isUsableAudioBuffer(buffer);
+  } catch {
+    return false;
+  }
+}
+
+function isUsableAudioBuffer(buffer) {
+  if (!buffer || buffer.length < 1024) return false;
+  const startsWithId3 = buffer.subarray(0, 3).toString("ascii") === "ID3";
+  const startsWithFrameSync = buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0;
+  return startsWithId3 || startsWithFrameSync;
 }
 
 function sendJson(res, status, data) {
